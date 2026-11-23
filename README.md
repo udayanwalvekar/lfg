@@ -1,6 +1,8 @@
 # lfg
 
-Keep your Mac awake with the lid shut for a few hours, then let it go back to normal by itself. Useful when a long download, a render or an AI agent should keep working while you close the laptop and walk away.
+**LFG = let's fucking go.** Type `lfg` and shut the lid: your Mac keeps working for as long as you said, then it can sleep again.
+
+I wanted my laptop to stay awake with the lid shut while things kept running: a long download, a render, an AI agent working through the night. I tried `caffeinate`, I tried apps, and none of them did the whole job. So I made my own.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/udayanwalvekar/lfg/main/lfg.sh | bash
@@ -11,6 +13,38 @@ That's the whole install. You can also download [`lfg.sh`](lfg.sh) and run `bash
 **Needs:** a Mac, an admin account on it (you type your Mac password to start and to stop), and Python 3.9 or newer (it comes with Apple's Command Line Tools: `xcode-select --install`).
 
 The installer puts the program in `~/.local/share/lfg` and the `lfg` command in a folder already on your PATH. It changes no Mac settings. (Only if no suitable folder is on your PATH does it add `~/.local/bin` to it, in `~/.zshrc`, or `~/.bash_profile` if your shell is bash.)
+
+## How to use it
+
+**Just type `lfg` and press Enter.** Type your Mac password once and it's on for 3 hours.
+
+<img src="docs/start.png" alt="Typing lfg: it asks for the Mac password once, then says it is on until 22:17 with 3 hours left" width="700">
+
+**Want a set number of hours?** Write the hours: `lfg 6` is 6 hours, `lfg 1.5` is an hour and a half.
+
+**Already on?** Type `lfg` again. It shows when it started, when it ends and how much time is left, then lets you add 3 hours, 6 hours or any number you type, turn it off, or leave it. Adding time needs no password.
+
+<img src="docs/picker.png" alt="lfg while on: started, ends, time left, a progress bar, and the choices Add 3 hours, Add 6 hours, Custom, Turn it off now, Leave it as it is" width="700">
+
+Pick Custom and type the hours: the new end time shows as you type.
+
+<img src="docs/custom.png" alt="Custom: typing 2.5 hours shows the new end time as you type" width="700">
+
+**Done early?** `lfg off`.
+
+**While it's on, your screen lock is off: anyone who opens the lid gets in without a password.** Keep the laptop with you.
+
+## lfg vs caffeinate
+
+`caffeinate` is the command that comes with every Mac. lfg uses it inside, and adds what it doesn't do:
+
+| | `caffeinate` | `lfg` |
+|---|---|---|
+| Lid shut | The Mac still goes to sleep (unless it's on power with an external display) | The Mac stays awake |
+| Screen lock | Not touched | Off while it runs, then back the way you had it |
+| How long | Stops when you close its Terminal window | Keeps going after you close the window; add time whenever you like |
+| At the end | Stops keeping the Mac awake | Lid sleep comes back by itself; a Terminal window asks for your password to put the screen lock back |
+| Password | None | Once to start, once to stop: keeping the Mac awake with the lid shut is a system setting, so it needs your admin password |
 
 ## Commands
 
