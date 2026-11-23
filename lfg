@@ -22,7 +22,6 @@ back on. Extending = writing a later time; nothing is restarted.
 https://github.com/udayanwalvekar/lfg
 """
 import datetime, fcntl, getpass, os, pwd, re, select, shutil, signal, stat, subprocess, sys, tempfile, termios, time, tty
-import urllib.request
 
 VERSION = '1.0.0'
 REPO = 'udayanwalvekar/lfg'
@@ -32,10 +31,12 @@ HOME = os.path.expanduser('~')
 STATE = os.path.join(HOME, '.lfg')
 SHARE = os.path.join(HOME, '.local', 'share', 'lfg')  # where the installer puts the program
 DEADLINE = os.path.join(STATE, 'until')
-STARTED = os.path.join(STATE, 'started')  # when the current run began (kept across extends and takeovers)
+STARTED = os.path.join(STATE, 'started')  # when the current run began (kept across extends)
+LOCK_BEFORE = os.path.join(STATE, 'lock-before')  # the screen lock as it was before lfg: immediate, seconds, off
 LOG = os.path.join(STATE, 'log')
 SUDO, PMSET, SYSADMINCTL, ID = '/usr/bin/sudo', '/usr/bin/pmset', '/usr/sbin/sysadminctl', '/usr/bin/id'
-CAFFEINATE, OSASCRIPT, PS, KILL, SH = '/usr/bin/caffeinate', '/usr/bin/osascript', '/bin/ps', '/bin/kill', '/bin/sh'
+CAFFEINATE, OSASCRIPT, PS, SH = '/usr/bin/caffeinate', '/usr/bin/osascript', '/bin/ps', '/bin/sh'
+CURL, NOTHING = '/usr/bin/curl', '/usr/bin/true'
 ROOT = 'root'  # the user the admin loop runs as
 TICK = 20  # seconds between the loops' looks at the end time
 DEFAULT_HOURS = 3
@@ -54,15 +55,19 @@ _READ = ('e=; if [ -f "$f" ] && [ ! -L "$f" ]; then e=$(/usr/bin/head -c 12 "$f"
 ROOT_LOOP = ('f=$1; tick=$2; good=$3; pmset=$4; cap=$5; '
              'while :; do ' + _READ + '/bin/sleep "$tick"; done; "$pmset" -a disablesleep 0')
 # As him: keep the Mac awake (caffeinate ends by itself if this loop is killed), and at a natural end open a
-# Terminal window for the password that turns the screen lock back on. Turned off by hand (0) = no window.
+# Terminal window for the password that puts the screen lock back as it was. Turned off by hand (0) = no window.
+# Screen lock off before lfg = $6 is a program that does nothing, so no window.
 USER_LOOP = ('f=$1; tick=$2; good=$3; caff=$4; cap=$5; osa=$6; c=; '
              'while :; do ' + _READ +
              'if [ -z "$c" ] || ! kill -0 "$c" 2>/dev/null; then "$caff" -dimsu -t 259200 -w $$ & c=$!; fi; '
              '/bin/sleep "$tick"; done; '
              '[ -n "$c" ] && kill "$c" 2>/dev/null; '
              '[ "$e" -ne 0 ] && "$osa" -e "$7" -e "$8"')
-RELOCK = ('tell application "Terminal" to do script "echo; echo \'  lfg is over. Type your Mac password to turn '
-          'the screen lock back on.\'; sysadminctl -screenLock immediate -password -"')
+def relock(value):
+    """The Terminal window's script at a natural end: the screen lock back to `value` (immediate or seconds,
+    already checked to be one of those)."""
+    return ('tell application "Terminal" to do script "echo; echo \'  lfg is over. Type your Mac password to turn '
+            'the screen lock back on.\'; sysadminctl -screenLock %s -password -"' % value)
 
 # ---- looks (same colours as ccd / ccdm) ------------------------------------------------------------------
 TEAL, SKY, AMBER = (45, 212, 191), (56, 189, 248), (251, 191, 36)
@@ -207,12 +212,16 @@ def read_time(path):
     return int(text) if text.isdigit() and len(text) <= 10 else None
 
 
-def write_time(path, epoch):
+def write_text(path, text):
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=STATE, prefix='.time-')
     with os.fdopen(fd, 'w') as f:
-        f.write('%d\n' % epoch)
+        f.write(text + '\n')
     os.replace(tmp, path)  # all at once: a loop never reads half a number
+
+
+def write_time(path, epoch):
+    write_text(path, '%d' % epoch)
 
 
 def read_end():
@@ -228,9 +237,37 @@ def sleep_disabled():
     return bool(m and m.group(1) == '1')
 
 
-def lock_off():
+def lock_setting():
+    """The screen lock now: 'off', 'immediate', a number of seconds (as text), or None if macOS didn't say."""
     r = run([SYSADMINCTL, '-screenLock', 'status'])
-    return 'screenLock is off' in (r.stdout + r.stderr)
+    text = r.stdout + r.stderr
+    if 'screenLock is off' in text:
+        return 'off'
+    m = re.search(r'screenLock delay is (immediate|\d{1,6})\b', text)
+    return m.group(1) if m else None
+
+
+def lock_off():
+    return lock_setting() == 'off'
+
+
+def read_lock_before():
+    try:
+        if not stat.S_ISREG(os.lstat(LOCK_BEFORE).st_mode):
+            return None
+        with open(LOCK_BEFORE) as f:
+            v = f.read(12).strip()
+    except OSError:
+        return None
+    return v if v in ('off', 'immediate') or (v.isdigit() and len(v) <= 6) else None
+
+
+def remember_lock(now):
+    """Before a run turns the screen lock off: keep how it was, to put it back exactly so. A lock that is off
+    only because an earlier run's lock window was ignored keeps the setting saved back then."""
+    if now is None or (now == 'off' and read_lock_before() is not None):
+        return
+    write_text(LOCK_BEFORE, now)
 
 
 def status():
@@ -240,7 +277,10 @@ def status():
     mine = lambda p, name: p['cmd'].startswith(SH + ' -c ') and (' %s %s ' % (name, DEADLINE)) in p['cmd']
     s = dict(now=now, admin=[p for p in procs if p['user'] == ROOT and mine(p, 'lfg-root')],
              awake=[p for p in procs if p['user'] == me and mine(p, 'lfg-user')],
-             sleep_off=sleep_disabled(), lock_off=lock_off(), end=read_end())
+             sleep_off=sleep_disabled(), lock=lock_setting(), lock_was=read_lock_before(), end=read_end())
+    s['lock_off'] = s['lock'] == 'off'
+    # Off because of lfg (it was on before a run), not because that is how he keeps it.
+    s['lock_left_off'] = s['lock_off'] and s['lock_was'] not in (None, 'off')
     s['started'] = None
     if s['admin'] and s['end'] and s['end'] > now:
         s['kind'], s['until'] = 'on', s['end']
@@ -266,7 +306,7 @@ def describe(s, out=None):
         aside('Left over from an earlier run, or set by something else. lfg starts a fresh run; lfg off puts it back.', out)
     else:
         say('·', 'lfg is off', 'lfg = 3 hours, lfg 6 = 6 hours', style='2', out=out)
-    if s['kind'] in ('off', 'stuck') and s['lock_off']:
+    if s['kind'] in ('off', 'stuck') and s['lock_left_off']:
         say('!', 'The screen lock is still off', 'lfg off turns it back on', style=colour(AMBER), out=out)
 
 
@@ -286,18 +326,13 @@ def ask(prompt):
 
 
 def is_admin():
-    """In the admin group (sudo works for admins only, out of the box). If id can't tell, let sudo decide."""
+    """In the admin group (out of the box, only admins can use sudo). If id can't tell, assume so."""
     r = run([ID, '-Gn'])
     return r.returncode != 0 or 'admin' in r.stdout.split()
 
 
 def password(why, more=''):
     """His Mac password, checked with sudo before anything changes. None if he gave up."""
-    if not is_admin():
-        say('!', 'lfg needs an admin account on this Mac', 'yours is a standard account · nothing changed',
-            style=colour(AMBER))
-        aside('Keeping the Mac awake with the lid shut is a setting only an admin can change.')
-        return None
     say('✦', why)
     if more:
         aside(more)
@@ -308,6 +343,11 @@ def password(why, more=''):
             log('password ok')
             return pw
         log('password refused')
+        if not is_admin():  # no password would do: say why instead of asking again
+            say('!', 'lfg needs an admin account on this Mac', 'yours is a standard account · nothing changed',
+                style=colour(AMBER))
+            aside('Keeping the Mac awake with the lid shut is a setting only an admin can change.')
+            return None
         if left > 1:
             say('!', "That password didn't work", '%d more %s' % (left - 1, 'try' if left == 2 else 'tries'),
                 style=colour(AMBER))
@@ -336,15 +376,15 @@ def wait_for(test, secs=5):
     return status()
 
 
-def screen_lock(pw, on):
-    """Screen lock on (immediate) or off, with the password on stdin. Judged by reading it back; if the piped
-    password was not taken, sysadminctl asks in the terminal itself."""
-    want = 'immediate' if on else 'off'
-    if lock_off() != on:
+def screen_lock(pw, want):
+    """Screen lock to `want` (off, immediate or seconds), with the password on stdin. Judged by reading it back;
+    if the piped password was not taken, sysadminctl asks in the terminal itself."""
+    done = (lambda: lock_off()) if want == 'off' else (lambda: not lock_off())
+    if done():
         return True
     r = run([SYSADMINCTL, '-screenLock', want, '-password', '-'], pw)
     log('screen lock %s: exit %d' % (want, r.returncode))
-    if lock_off() != on:
+    if done():
         return True
     say('!', 'The screen lock needs your password once more', 'macOS did not take it the first time',
         style=colour(AMBER))
@@ -352,7 +392,7 @@ def screen_lock(pw, on):
         subprocess.run([SYSADMINCTL, '-screenLock', want, '-password', '-'], stdin=open('/dev/tty'), timeout=120)
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return lock_off() != on
+    return done()
 
 
 def start(end, pw):
@@ -368,6 +408,8 @@ def start(end, pw):
     log('end set to %s' % clock(end))
     # When this run began: carried over from a run already going, else now.
     write_time(STARTED, int(s['started'] if s['kind'] == 'on' and s['started'] else time.time()))
+    remember_lock(s['lock'])
+    was = read_lock_before() or 'immediate'
     if not s['admin']:
         subprocess.run([SUDO, '-S', '-p', '', '-b', SH, '-c', ROOT_LOOP, 'lfg-root', DEADLINE, str(TICK), str(end),
                         PMSET, str(MAX_HOURS * 3600)], input=pw + '\n', text=True, stdout=subprocess.DEVNULL,
@@ -379,10 +421,11 @@ def start(end, pw):
     log('lid sleep off: exit %d' % r.returncode)
     if not s['awake']:
         subprocess.Popen([SH, '-c', USER_LOOP, 'lfg-user', DEADLINE, str(TICK), str(end), CAFFEINATE,
-                          str(MAX_HOURS * 3600), OSASCRIPT, 'tell application "Terminal" to activate', RELOCK],
+                          str(MAX_HOURS * 3600), NOTHING if was == 'off' else OSASCRIPT,
+                          'tell application "Terminal" to activate', relock(was)],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
-    screen_lock(pw, on=False)
+    screen_lock(pw, 'off')
     new = wait_for(lambda x: x['admin'] and x['awake'] and x['sleep_off'])
     log('loops: admin %s, awake %s, lid sleep off %s, screen lock off %s'
         % (bool(new['admin']), bool(new['awake']), new['sleep_off'], new['lock_off']))
@@ -393,7 +436,9 @@ def turn_off(pw):
     write_end(0)  # the loops see 0 at their next look and end quietly (no lock window)
     r = run([SUDO, '-S', '-p', '', PMSET, '-a', 'disablesleep', '0'], pw)
     log('off: lid sleep back on, exit %d' % r.returncode)
-    screen_lock(pw, on=True)
+    was = read_lock_before() or 'immediate'  # no record: on is the safe side
+    if was != 'off':
+        screen_lock(pw, was)
     return status()
 
 
@@ -674,14 +719,24 @@ def installed(args):
     return 0
 
 
+def fetch(url):
+    """The page's bytes, by the Mac's own curl (its certificates work even where this Python's don't)."""
+    try:
+        r = subprocess.run([CURL, '-fsSL', '--max-time', '30', url], capture_output=True, timeout=40)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise OSError(str(e))
+    if r.returncode:
+        raise OSError(r.stderr.decode('utf-8', 'replace').strip() or 'curl exit %d' % r.returncode)
+    return r.stdout
+
+
 def update(args):
     """`lfg update`: fetch the newest lfg.sh and run it over this one. A run that is on keeps going."""
     print('lfg: checking for a newer lfg…', file=sys.stderr)
     try:
-        body = urllib.request.urlopen(LATEST + '?v=%d' % time.time(), timeout=20).read()
-    except Exception as e:
-        print("lfg update: couldn't reach GitHub (%s). Nothing changed." % (getattr(e, 'reason', None) or e),
-              file=sys.stderr)
+        body = fetch(LATEST + '?v=%d' % time.time())
+    except OSError as e:
+        print("lfg update: couldn't reach GitHub (%s). Nothing changed." % e, file=sys.stderr)
         return 1
     found = re.search(rb"^VERSION = '([0-9.]+)'$", body, re.M)
     if not (body.startswith(b'#!/usr/bin/env bash') and b'LFG_PROGRAM_END' in body and found):
@@ -711,40 +766,41 @@ def uninstall(args):
     """`lfg uninstall`: remove the program, its command and ~/.lfg. Refused while a run is on, so nothing is
     left with lid sleep off and no one to turn it back on."""
     s = status()
-    if s['kind'] == 'on' or s['admin'] or s['awake']:
-        say('!', 'lfg is on right now', 'turn it off first: lfg off · then lfg uninstall', style=colour(AMBER))
+    if s['kind'] in ('on', 'stuck') or s['admin'] or s['awake'] or s['lock_left_off']:
+        why = 'lfg is on right now' if s['kind'] == 'on' or s['admin'] or s['awake'] else \
+            'Lid sleep is still off' if s['kind'] == 'stuck' else 'The screen lock is still off from a run'
+        say('!', why, 'lfg off puts it right · then lfg uninstall', style=colour(AMBER))
         return 1
     me = os.path.realpath(os.path.join(SHARE, 'lfg'))
-    for d in os.environ.get('PATH', '').split(':') + [os.path.join(HOME, '.local', 'bin')]:
+    places = [os.path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', os.path.join(HOME, 'bin')]
+    for d in os.environ.get('PATH', '').split(':') + places:  # the installer's choices, wherever this runs from
         p = os.path.join(d, 'lfg')
         if d and os.path.islink(p) and os.path.realpath(p) == me:
             os.unlink(p)
     shutil.rmtree(SHARE, ignore_errors=True)
     shutil.rmtree(STATE, ignore_errors=True)
     say('✓', 'lfg is removed')
-    if s['kind'] == 'stuck':
-        say('!', 'Lid sleep is still off on this Mac', 'turn it back on: sudo pmset -a disablesleep 0',
-            style=colour(AMBER))
     return 0
 
 
 def act(what, hours, s):
     running = s['kind'] == 'on'
     if what == 'off':
-        if s['kind'] == 'off' and not s['lock_off']:
+        if s['kind'] == 'off' and not s['lock_left_off']:
             describe(s)
             return 0
-        pw = password('Turn lfg off · sleep and the screen lock come back')
+        pw = password('Turn lfg off · sleep and your screen lock come back')
         if pw is None:
             return 1
         with Busy():
             new = turn_off(pw)
         del pw
-        if not new['sleep_off'] and not new['lock_off']:
-            say('✓', 'lfg is off · sleep and the screen lock are back to normal')
+        lock_bad = new['lock_off'] and (new['lock_was'] or 'immediate') != 'off'
+        if not new['sleep_off'] and not lock_bad:
+            say('✓', 'lfg is off · sleep and the screen lock are back as you had them')
             return 0
         left = [w for w, bad in (('lid sleep is still off', new['sleep_off']),
-                                 ('the screen lock is still off', new['lock_off'])) if bad]
+                                 ('the screen lock is still off', lock_bad)) if bad]
         say('!', 'Turned off, but ' + ' and '.join(left), 'see ~/.lfg/log', style=colour(AMBER))
         return 1
 

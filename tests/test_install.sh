@@ -59,6 +59,21 @@ out="$(run "$H" bash "$PWD/lfg.sh")" || true
 grep -q "another program" <<<"$out" && [ ! -L "$H/.local/bin/lfg" ] && ok "...left in place, and it says so" \
   || bad "foreign lfg: $out"
 grep -q "own lfg alias" <<<"$out" && ok "an lfg alias in .zshrc is pointed out" || bad "alias not mentioned: $out"
+for form in 'alias -g lfg=x' 'function lfg {' 'lfg() {' '  function lfg() {'; do
+  printf '%s\n' "$form" > "$H/.zshrc"
+  out="$(run "$H" bash "$PWD/lfg.sh")" || true
+  grep -q "own lfg alias" <<<"$out" && ok "...also when written as: $form" || bad "not pointed out: $form"
+done
+printf 'alias lfgx=1\nfunction lfgo {\n' > "$H/.zshrc"
+out="$(run "$H" bash "$PWD/lfg.sh")" || true
+grep -q "own lfg alias" <<<"$out" && bad "lfgx/lfgo mistaken for lfg" || ok "...and not for other names (lfgx, lfgo)"
+
+H="$(fresh lockedrc)"
+mkdir -p "$H/x" && touch "$H/.zshrc" && chmod 444 "$H/.zshrc"
+out="$(limit 60 env -i HOME="$H" PATH="/usr/bin:/bin:/usr/sbin:/sbin" SHELL=/bin/zsh bash "$PWD/lfg.sh" </dev/null 2>&1)" \
+  && [ -L "$H/.local/bin/lfg" ] && grep -q "couldn't add" <<<"$out" \
+  && ok "a read-only .zshrc: still installs, and says the PATH line couldn't be added" || bad "read-only .zshrc: $out"
+chmod 644 "$H/.zshrc"
 
 H="$(fresh shim)"
 mkdir -p "$H/shims"

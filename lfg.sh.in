@@ -62,7 +62,9 @@ if [ -z "$BIN" ]; then  # none: ~/.local/bin, and a PATH line for it unless thei
   RC="${HOME}/.zshrc"
   case "${SHELL:-}" in */bash) RC="${HOME}/.bash_profile" ;; esac
   if ! grep -Eqs '^[^#]*PATH=.*\.local/bin' "$RC"; then
-    printf '\n# lfg\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+    if ! { printf '\n# lfg\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"; } 2>/dev/null; then
+      note "lfg install: couldn't add ~/.local/bin to your PATH in ${RC/#$HOME/~} (not writable)."
+    fi
   fi
   NEW_TAB=1
 fi
@@ -78,7 +80,7 @@ fi
 
 # Their own alias or function called lfg would win over the program.
 for rc in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.zprofile"; do
-  if grep -Eqs '^[[:space:]]*(alias[[:space:]]+lfg=|(function[[:space:]]+)?lfg[[:space:]]*\(\))' "$rc"; then
+  if grep -Eqs '^[[:space:]]*(alias([[:space:]]+-[a-zA-Z]+)*[[:space:]]+lfg=|function[[:space:]]+lfg([[:space:]({]|$)|lfg[[:space:]]*\(\))' "$rc"; then
     note "lfg install: ${rc/#$HOME/~} has its own lfg alias or function, which wins over this one. Remove it to use this lfg."
   fi
 done

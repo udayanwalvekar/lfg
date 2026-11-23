@@ -36,8 +36,12 @@ esac
     'sysadminctl': r'''#!/bin/bash
 D="$LFG_TEST_DIR"
 if [ "$2" = status ]; then
-  if [ "$(cat "$D/lock" 2>/dev/null)" = off ]; then echo "x sysadminctl[1:2] screenLock is off" >&2
-  else echo "x sysadminctl[1:2] screenLock delay is immediate" >&2; fi
+  v="$(cat "$D/lock" 2>/dev/null)"
+  case "$v" in
+    off) echo "x sysadminctl[1:2] screenLock is off" >&2;;
+    [0-9]*) echo "x sysadminctl[1:2] screenLock delay is $v seconds" >&2;;
+    *) echo "x sysadminctl[1:2] screenLock delay is immediate" >&2;;
+  esac
   exit 0
 fi
 IFS= read -r pw
@@ -60,10 +64,10 @@ D="$LFG_TEST_DIR"
 /bin/ps "$@" | grep -F "$D/state" | grep -v grep
 exit 0
 ''',
-    # Never kills anything real: only logs.
-    'kill': r'''#!/bin/bash
-echo "kill $*" >> "$LFG_TEST_DIR/calls.log"
-exit 0
+    # Never reaches the internet.
+    'curl': r'''#!/bin/bash
+echo "curl $*" >> "$LFG_TEST_DIR/calls.log"
+cat "$LFG_TEST_DIR/download" 2>/dev/null || { echo "curl: (6) Could not resolve host" >&2; exit 6; }
 ''',
     # The groups this user is in: an admin unless the test says otherwise.
     'id': r'''#!/bin/bash
@@ -86,14 +90,15 @@ class Sandbox(unittest.TestCase):
         state = self.d + '/state'
         self.patches = [mock.patch.multiple(
             lfg, SUDO=b + 'sudo', PMSET=b + 'pmset', SYSADMINCTL=b + 'sysadminctl', CAFFEINATE=b + 'caffeinate',
-            OSASCRIPT=b + 'osascript', PS=b + 'ps', KILL=b + 'kill', ID=b + 'id', ROOT=ME, TICK=1,
-            STATE=state, DEADLINE=state + '/until', LOG=state + '/log', STARTED=state + '/started',
+            OSASCRIPT=b + 'osascript', PS=b + 'ps', ID=b + 'id', ROOT=ME, TICK=1,
+            STATE=state, DEADLINE=state + '/until', LOG=state + '/log', STARTED=state + '/started', LOCK_BEFORE=state + '/lock-before',
+            CURL=b + 'curl',
             SHARE=self.d + '/share', HOME=self.d + '/home')]
         for p in self.patches:
             p.start()
         # Fail closed: nothing below may run if a real program would be used.
-        for name in ('SUDO', 'PMSET', 'SYSADMINCTL', 'CAFFEINATE', 'OSASCRIPT', 'PS', 'KILL', 'ID', 'STATE', 'DEADLINE',
-                     'LOG', 'STARTED', 'SHARE', 'HOME'):
+        for name in ('SUDO', 'PMSET', 'SYSADMINCTL', 'CAFFEINATE', 'OSASCRIPT', 'PS', 'ID', 'CURL', 'STATE', 'DEADLINE',
+                     'LOG', 'STARTED', 'LOCK_BEFORE', 'SHARE', 'HOME'):
             if not getattr(lfg, name).startswith(self.d + '/'):
                 raise SystemExit('refusing to run: %s is not the sandbox stand-in' % name)
         self.write('sleepdisabled', '0')
@@ -276,7 +281,7 @@ class Ending(Sandbox):
         self.assertEqual(self.read('sleepdisabled').strip(), '0')
 
     def test_bad_end_file_keeps_the_last_good_time(self):
-        self.lfg('0.002')  # ~7 s
+        self.lfg('0.003')  # ~11 s: room for the 5 s of junk below on a busy Mac
         end = lfg.read_end()
         for junk in ('abc\n', '', '99999999999\n', '%d\n' % (time.time() + 100 * 3600)):
             with open(lfg.DEADLINE, 'w') as f:
@@ -307,12 +312,18 @@ class Plain(Sandbox):
 class Shared(Sandbox):
     """What the shared copy adds: the admin check, version, uninstall."""
 
-    def test_a_standard_account_is_told_and_never_asked(self):
+    def test_a_standard_account_is_told_after_one_try(self):
         self.write('groups', 'staff everyone localaccounts')
+        self.answers = ['whatever']
         self.assertEqual(self.lfg('2'), 1)
-        self.assertEqual(self.asked, [])
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(len(self.asked), 1)
+        self.assertFalse([c for c in self.calls() if not c.startswith('sudo-refused')])
         self.assertIn('needs an admin account', self.out)
+
+    def test_a_standard_account_with_sudo_rights_can_use_it(self):
+        self.write('groups', 'staff everyone localaccounts')
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(lfg.status()['kind'], 'on')
 
     def test_version(self):
         self.assertEqual(self.lfg('--version'), 0)
@@ -353,20 +364,84 @@ class Shared(Sandbox):
         self.assertEqual(self.lfg('uninstall'), 0, self.out)
         self.assertTrue(os.path.exists(self.d + '/onpath/lfg'))
 
-    def test_update_refuses_what_is_not_lfg(self):
-        class Fake:
-            def __init__(self, body): self.body = body
-            def read(self): return self.body
-        with mock.patch.object(lfg.urllib.request, 'urlopen', return_value=Fake(b'<html>404</html>')), \
-                mock.patch.object(lfg.subprocess, 'run') as ran:
+    def test_update_refuses_what_is_not_lfg_and_never_runs_it(self):
+        self.write('download', '<html>404</html>')
+        with mock.patch.object(lfg.subprocess, 'run', wraps=lfg.subprocess.run) as ran:
             self.assertEqual(lfg.update([]), 1)
-            ran.assert_not_called()
-        same = b"#!/usr/bin/env bash\nLFG_PROGRAM_END\nVERSION = '%s'\n" % lfg.VERSION.encode()
-        with mock.patch.object(lfg.urllib.request, 'urlopen', return_value=Fake(same)), \
-                mock.patch.object(lfg.subprocess, 'run') as ran, redirect_stdout(io.StringIO()) as out:
+        self.assertEqual([c.args[0][0] for c in ran.call_args_list], [lfg.CURL])
+        self.write('download', "#!/usr/bin/env bash\nLFG_PROGRAM_END\nVERSION = '%s'\n" % lfg.VERSION)
+        with mock.patch.object(lfg.subprocess, 'run', wraps=lfg.subprocess.run) as ran, \
+                redirect_stdout(io.StringIO()) as out:
             self.assertEqual(lfg.update([]), 0)
-            ran.assert_not_called()
+        self.assertEqual([c.args[0][0] for c in ran.call_args_list], [lfg.CURL])
         self.assertIn('newest', out.getvalue())
+
+    def test_update_with_no_internet_says_so(self):
+        self.assertEqual(lfg.update([]), 1)
+        self.assertEqual(len([c for c in self.calls() if c.startswith('curl')]), 1)
+
+    def test_uninstall_is_refused_while_lid_sleep_is_left_off(self):
+        self.make_install()
+        self.write('sleepdisabled', '1')
+        self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertIn('lfg off', self.out)
+        self.assertTrue(os.path.exists(lfg.SHARE + '/lfg'))
+
+    def test_uninstall_is_refused_while_a_runs_lock_is_left_off(self):
+        self.make_install()
+        self.write('lock', 'off')
+        self.write('state/lock-before', 'immediate')
+        self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertTrue(os.path.exists(lfg.SHARE + '/lfg'))
+
+
+class ScreenLock(Sandbox):
+    """The screen lock goes back to how each person had it."""
+
+    def test_kept_off_by_choice_stays_off_with_no_window_and_no_warning(self):
+        self.write('lock', 'off')
+        self.assertEqual(self.lfg('0.0015'), 0, self.out)  # ~5 s
+        self.assertEqual(self.read('state/lock-before').strip(), 'off')
+        self.assertTrue(self.wait(lambda: self.loops() == (0, 0), 30))
+        self.assertTrue(self.wait(lambda: not self.awake_running(), 10))
+        time.sleep(1)
+        self.assertFalse([c for c in self.calls() if c.startswith('osascript')])
+        self.assertEqual(self.read('lock').strip(), 'off')
+        self.lfg('status')
+        self.assertNotIn('screen lock', self.out)
+
+    def test_off_by_choice_then_lfg_off_leaves_it_off(self):
+        self.write('lock', 'off')
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(self.lfg('off'), 0, self.out)
+        self.assertEqual(self.read('lock').strip(), 'off')
+        self.assertFalse([c for c in self.calls() if c.startswith('sysadminctl')])
+
+    def test_a_delay_comes_back_as_the_same_delay(self):
+        self.write('lock', '300')
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(self.read('lock').strip(), 'off')
+        self.assertEqual(self.lfg('off'), 0, self.out)
+        self.assertEqual(self.read('lock').strip(), '300')
+
+    def test_the_window_at_the_end_puts_back_the_delay(self):
+        self.write('lock', '300')
+        self.assertEqual(self.lfg('0.0015'), 0, self.out)
+        self.assertTrue(self.wait(lambda: [c for c in self.calls() if c.startswith('osascript')], 30))
+        osa = [c for c in self.calls() if c.startswith('osascript')][0]
+        self.assertIn('screenLock 300 -password', osa)
+
+    def test_an_ignored_window_does_not_make_off_the_new_normal(self):
+        self.write('lock', '300')
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.write('state/until', '0')  # it ends; the lock window is ignored, so the lock stays off
+        self.assertTrue(self.wait(lambda: self.loops() == (0, 0), 15))
+        self.write('sleepdisabled', '0')
+        self.assertEqual(self.read('lock').strip(), 'off')
+        self.assertEqual(self.lfg('2'), 0, self.out)  # a new run
+        self.assertEqual(self.read('state/lock-before').strip(), '300')
+        self.assertEqual(self.lfg('off'), 0, self.out)
+        self.assertEqual(self.read('lock').strip(), '300')
 
 
 class Review(Sandbox):
@@ -402,6 +477,8 @@ class Review(Sandbox):
 
     def test_off_turns_a_left_off_screen_lock_back_on(self):
         self.write('lock', 'off')  # a run ended and the lock window was ignored
+        os.makedirs(self.d + '/state', exist_ok=True)
+        self.write('state/lock-before', 'immediate')
         self.lfg('status')
         self.assertIn('screen lock is still off', self.out)
         self.assertEqual(self.lfg('off'), 0, self.out)
