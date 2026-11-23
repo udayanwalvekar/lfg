@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# lfg, in one file. Install it with:   bash lfg.sh
+# or, from anywhere:   curl -fsSL https://raw.githubusercontent.com/udayanwalvekar/lfg/main/lfg.sh | bash
+#
+# What it does: puts lfg on this Mac (the program goes in ~/.local/share/lfg, the command in a folder already on
+# your PATH). lfg keeps the Mac awake with the lid shut for a few hours, then puts sleep and the screen lock back.
+# Nothing is downloaded: the program is inside this file. Installing changes no Mac settings; lfg itself does,
+# only when you run it and type your password.
+# Remove it all again with:   lfg uninstall
+set -euo pipefail
+
+SHARE="${HOME}/.local/share/lfg"
+
+fail() { printf 'lfg install: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+
+[ "$(uname -s)" = "Darwin" ] || fail "lfg works on macOS only."
+
+# Python 3.9 or newer, without setting off the "install developer tools" pop-up (/usr/bin/python3 is only a
+# stand-in until those tools are installed). Fixed places first: a python3 early on PATH is often a pyenv or asdf
+# shim (a small script) or a virtualenv that may be deleted later.
+PY=""
+for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
+  p="$(command -v "$c" 2>/dev/null || true)"
+  [ -n "$p" ] || continue
+  if [ "$p" = "/usr/bin/python3" ] && ! xcode-select -p >/dev/null 2>&1; then continue; fi
+  "$p" -I -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null || continue
+  # A #! line can't point at another script (bash would run the program itself as shell): the real Python then.
+  if [ "$(head -c 2 "$p" 2>/dev/null)" = '#!' ]; then
+    p="$("$p" -I -c 'import sys; print(sys.executable)' 2>/dev/null || true)"
+    if [ -z "$p" ] || [ ! -x "$p" ] || [ "$(head -c 2 "$p" 2>/dev/null)" = '#!' ]; then continue; fi
+  fi
+  PY="$p"
+  break
+done
+[ -n "$PY" ] || fail "lfg needs Python 3.9 or newer. Get it with: xcode-select --install   (then run this again)"
+
+mkdir -p "$SHARE"
+{ printf '#!%s -I\n' "$PY"  # the Python found above, by its path
+  cat <<'LFG_PROGRAM_END'
+@@PROGRAM@@
+LFG_PROGRAM_END
+} > "${SHARE}/lfg.new"
+"$PY" -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "${SHARE}/lfg.new" 2>/dev/null \
+  || { rm -f "${SHARE}/lfg.new"; fail "this file is damaged (cut short?); get a fresh copy of lfg.sh"; }
+chmod 755 "${SHARE}/lfg.new"
+"${SHARE}/lfg.new" --version >/dev/null 2>&1 </dev/null \
+  || { rm -f "${SHARE}/lfg.new"; fail "lfg didn't start with ${PY}; nothing was changed"; }
+mv -f "${SHARE}/lfg.new" "${SHARE}/lfg"
+
+# A folder already on PATH, so lfg works in this terminal straight away.
+BIN=""
+for d in "${HOME}/.local/bin" /opt/homebrew/bin /usr/local/bin "${HOME}/bin"; do
+  case ":${PATH}:" in
+    *":${d}:"*) if [ -d "$d" ] && [ -w "$d" ]; then BIN="$d"; break; fi ;;
+  esac
+done
+NEW_TAB=""
+if [ -z "$BIN" ]; then  # none: ~/.local/bin, and a PATH line for it unless their settings have one
+  BIN="${HOME}/.local/bin"
+  mkdir -p "$BIN"
+  RC="${HOME}/.zshrc"
+  case "${SHELL:-}" in */bash) RC="${HOME}/.bash_profile" ;; esac
+  if ! grep -Eqs '^[^#]*PATH=.*\.local/bin' "$RC"; then
+    printf '\n# lfg\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+  fi
+  NEW_TAB=1
+fi
+
+BLOCKED=""
+t="${BIN}/lfg"
+if { [ -e "$t" ] || [ -L "$t" ]; } && { [ ! -L "$t" ] || [ "$(readlink "$t")" != "${SHARE}/lfg" ]; }; then
+  note "lfg install: ${t} is another program, so it was left alone: typing lfg won't reach this one."
+  BLOCKED=1
+else
+  ln -sfn "${SHARE}/lfg" "$t"
+fi
+
+# Their own alias or function called lfg would win over the program.
+for rc in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.zprofile"; do
+  if grep -Eqs '^[[:space:]]*(alias[[:space:]]+lfg=|(function[[:space:]]+)?lfg[[:space:]]*\(\))' "$rc"; then
+    note "lfg install: ${rc/#$HOME/~} has its own lfg alias or function, which wins over this one. Remove it to use this lfg."
+  fi
+done
+
+if [ -z "${LFG_QUIET:-}" ]; then  # not on an update
+  "${SHARE}/lfg" installed </dev/null || true
+fi
+if [ -n "$BLOCKED" ]; then
+  note "To use lfg anyway, run it by its full path: ${SHARE}/lfg"
+fi
+if [ -n "$NEW_TAB" ]; then
+  note "Open a new terminal tab for lfg to be found."
+fi

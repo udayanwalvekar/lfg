@@ -1,0 +1,900 @@
+#!/usr/bin/env bash
+# lfg, in one file. Install it with:   bash lfg.sh
+# or, from anywhere:   curl -fsSL https://raw.githubusercontent.com/udayanwalvekar/lfg/main/lfg.sh | bash
+#
+# What it does: puts lfg on this Mac (the program goes in ~/.local/share/lfg, the command in a folder already on
+# your PATH). lfg keeps the Mac awake with the lid shut for a few hours, then puts sleep and the screen lock back.
+# Nothing is downloaded: the program is inside this file. Installing changes no Mac settings; lfg itself does,
+# only when you run it and type your password.
+# Remove it all again with:   lfg uninstall
+set -euo pipefail
+
+SHARE="${HOME}/.local/share/lfg"
+
+fail() { printf 'lfg install: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+
+[ "$(uname -s)" = "Darwin" ] || fail "lfg works on macOS only."
+
+# Python 3.9 or newer, without setting off the "install developer tools" pop-up (/usr/bin/python3 is only a
+# stand-in until those tools are installed). Fixed places first: a python3 early on PATH is often a pyenv or asdf
+# shim (a small script) or a virtualenv that may be deleted later.
+PY=""
+for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
+  p="$(command -v "$c" 2>/dev/null || true)"
+  [ -n "$p" ] || continue
+  if [ "$p" = "/usr/bin/python3" ] && ! xcode-select -p >/dev/null 2>&1; then continue; fi
+  "$p" -I -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null || continue
+  # A #! line can't point at another script (bash would run the program itself as shell): the real Python then.
+  if [ "$(head -c 2 "$p" 2>/dev/null)" = '#!' ]; then
+    p="$("$p" -I -c 'import sys; print(sys.executable)' 2>/dev/null || true)"
+    if [ -z "$p" ] || [ ! -x "$p" ] || [ "$(head -c 2 "$p" 2>/dev/null)" = '#!' ]; then continue; fi
+  fi
+  PY="$p"
+  break
+done
+[ -n "$PY" ] || fail "lfg needs Python 3.9 or newer. Get it with: xcode-select --install   (then run this again)"
+
+mkdir -p "$SHARE"
+{ printf '#!%s -I\n' "$PY"  # the Python found above, by its path
+  cat <<'LFG_PROGRAM_END'
+"""lfg: keep the Mac awake with the lid shut (and the screen unlocked) for a few
+hours, then put sleep and the screen lock back.
+
+  lfg            on for 3 hours. Already on? Shows when it started, when it
+                 ends and how long is left, then: add 3 h, add 6 h, add any
+                 number of hours (Custom), turn off, or leave it.
+  lfg 6          on for 6 hours from now (never cuts a longer run short)
+  lfg +2         add 2 hours to the current end
+  lfg 0 | off    off now: sleep and the screen lock come back
+  lfg status     say whether it is on; changes nothing
+  lfg update     get the newest lfg
+  lfg uninstall  remove lfg from this Mac
+
+Your Mac password is asked once, only to start or to stop. Extending needs no password, so an agent can
+extend it while you are away (`lfg +3`).
+
+How it works: one time on disk (~/.lfg/until) says when it ends. Two small background loops read it every
+20 seconds: one (run as admin) turns lid sleep back on when the time has passed, the other keeps the Mac
+awake until then and, at the end, opens a Terminal window asking for the password to turn the screen lock
+back on. Extending = writing a later time; nothing is restarted.
+https://github.com/udayanwalvekar/lfg
+"""
+import datetime, fcntl, getpass, os, pwd, re, select, shutil, signal, stat, subprocess, sys, tempfile, termios, time, tty
+import urllib.request
+
+VERSION = '1.0.0'
+REPO = 'udayanwalvekar/lfg'
+LATEST = 'https://raw.githubusercontent.com/%s/main/lfg.sh' % REPO
+
+HOME = os.path.expanduser('~')
+STATE = os.path.join(HOME, '.lfg')
+SHARE = os.path.join(HOME, '.local', 'share', 'lfg')  # where the installer puts the program
+DEADLINE = os.path.join(STATE, 'until')
+STARTED = os.path.join(STATE, 'started')  # when the current run began (kept across extends and takeovers)
+LOG = os.path.join(STATE, 'log')
+SUDO, PMSET, SYSADMINCTL, ID = '/usr/bin/sudo', '/usr/bin/pmset', '/usr/sbin/sysadminctl', '/usr/bin/id'
+CAFFEINATE, OSASCRIPT, PS, KILL, SH = '/usr/bin/caffeinate', '/usr/bin/osascript', '/bin/ps', '/bin/kill', '/bin/sh'
+ROOT = 'root'  # the user the admin loop runs as
+TICK = 20  # seconds between the loops' looks at the end time
+DEFAULT_HOURS = 3
+MAX_HOURS = 72  # an end further away than this is refused here and ignored by the loops (a typo, not a wish)
+TRIES = 3
+
+# The two loops, each ONE line (ps prints a command on one line; a newline inside would break reading it back).
+# Args: $1 end-time file, $2 seconds between looks, $3 the end time at start, $4 program, $5 furthest end allowed.
+# A file that is missing, not a plain file (a pipe, a link), half-written or not a plain time keeps the last
+# good end: the run never stops early because of a bad read, and never runs on forever either. 0 = stop now.
+_READ = ('e=; if [ -f "$f" ] && [ ! -L "$f" ]; then e=$(/usr/bin/head -c 12 "$f" 2>/dev/null); fi; '
+         'now=$(/bin/date +%s); '
+         'case $e in ""|*[!0-9]*|???????????*) e=$good;; esac; '
+         '[ "$e" -gt $((now + cap)) ] && e=$good; good=$e; [ "$now" -ge "$e" ] && break; ')
+# As admin: lid sleep comes back once the end has passed.
+ROOT_LOOP = ('f=$1; tick=$2; good=$3; pmset=$4; cap=$5; '
+             'while :; do ' + _READ + '/bin/sleep "$tick"; done; "$pmset" -a disablesleep 0')
+# As him: keep the Mac awake (caffeinate ends by itself if this loop is killed), and at a natural end open a
+# Terminal window for the password that turns the screen lock back on. Turned off by hand (0) = no window.
+USER_LOOP = ('f=$1; tick=$2; good=$3; caff=$4; cap=$5; osa=$6; c=; '
+             'while :; do ' + _READ +
+             'if [ -z "$c" ] || ! kill -0 "$c" 2>/dev/null; then "$caff" -dimsu -t 259200 -w $$ & c=$!; fi; '
+             '/bin/sleep "$tick"; done; '
+             '[ -n "$c" ] && kill "$c" 2>/dev/null; '
+             '[ "$e" -ne 0 ] && "$osa" -e "$7" -e "$8"')
+RELOCK = ('tell application "Terminal" to do script "echo; echo \'  lfg is over. Type your Mac password to turn '
+          'the screen lock back on.\'; sysadminctl -screenLock immediate -password -"')
+
+# ---- looks (same colours as ccd / ccdm) ------------------------------------------------------------------
+TEAL, SKY, AMBER = (45, 212, 191), (56, 189, 248), (251, 191, 36)
+STOPS = [(45, 212, 191), (56, 189, 248), (167, 139, 250), (244, 114, 182), (251, 113, 133)]
+TRACK = (43, 45, 58)
+EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
+TRUECOLOR = os.environ.get('COLORTERM') in ('truecolor', '24bit')
+
+
+def colour(c, back=False):
+    kind = 48 if back else 38
+    if TRUECOLOR:
+        return '%d;2;%d;%d;%d' % ((kind,) + tuple(c))
+    if max(c) - min(c) < 24:  # a grey: the 24-step grey ramp is closer than the colour cube
+        return '%d;5;%d' % (kind, 232 + min(23, max(0, round((sum(c) / 3 - 8) / 10))))
+    return '%d;5;%d' % (kind, 16 + 36 * round(c[0] / 51) + 6 * round(c[1] / 51) + round(c[2] / 51))
+
+
+def heat(t):
+    x = min(max(t, 0), 1) * (len(STOPS) - 1)
+    i = min(int(x), len(STOPS) - 2)
+    return tuple(round(a + (b - a) * (x - i)) for a, b in zip(STOPS[i], STOPS[i + 1]))
+
+
+def bar(done, width):
+    """How much of the run has gone, as (text, style) pieces: gradient fill, a fractional tip, the track
+    (the same bar as ccdm's usage bars)."""
+    cells = min(max(done, 0), 1) * width
+    full = int(cells)
+    part = EIGHTHS[int((cells - full) * 8)]
+    out = []
+    for i in range(full):
+        c = colour(heat(int(i / width * 24) / 23))
+        if out and out[-1][1] == c:
+            out[-1] = (out[-1][0] + '█', c)
+        else:
+            out.append(('█', c))
+    if part:
+        out.append((part, colour(heat(max(done, 0.01))) + ';' + colour(TRACK, back=True)))
+    out.append(('█' * (width - full - (1 if part else 0)), colour(TRACK)))
+    return out
+
+
+def line(pieces, out=None):
+    """Print (text, style) pieces as one line. In a terminal: coloured and cut at the window edge (never
+    wraps). Anywhere else (an agent, a pipe): plain text, whole."""
+    out = out or sys.stdout
+    if out.isatty():
+        try:
+            cols = os.get_terminal_size(out.fileno()).columns
+        except OSError:
+            cols = 80
+        print(paint(pieces, cols), file=out, flush=True)
+    else:
+        print(''.join(t for t, _ in pieces), file=out, flush=True)
+
+
+def say(mark, text, note='', style=None, out=None):
+    """One line of output: a coloured mark, the words, an optional dim note."""
+    line([('  %s  ' % mark, (style or colour(TEAL)) + ';1'), (text, '')] + ([('  ·  ' + note, '2')] if note else []), out)
+
+
+def aside(text, out=None):
+    """A dim second line under the one above."""
+    line([('     ' + text, '2')], out)
+
+
+def clock(epoch, now=None):
+    """'00:30', '12:14 tomorrow', '12:14 Tue'."""
+    now = now or time.time()
+    t, today = datetime.datetime.fromtimestamp(epoch), datetime.datetime.fromtimestamp(now).date()
+    days = (t.date() - today).days
+    return t.strftime('%H:%M') + ('' if days <= 0 else ' tomorrow' if days == 1 else t.strftime(' %a'))
+
+
+def span(secs):
+    m = max(0, round(secs / 60))
+    h, m = divmod(m, 60)
+    return '%dh %02dm' % (h, m) if h else '%dm' % m
+
+
+def since(epoch, now=None):
+    """'21:14' today, '21:14 yesterday', '21:14 Sat'."""
+    now = now or time.time()
+    t, today = datetime.datetime.fromtimestamp(epoch), datetime.datetime.fromtimestamp(now).date()
+    days = (today - t.date()).days
+    return t.strftime('%H:%M') + ('' if days <= 0 else ' yesterday' if days == 1 else t.strftime(' %a'))
+
+
+def hours_words(h):
+    return ('%g hour' % h) + ('' if h == 1 else 's')
+
+
+# ---- what is running -------------------------------------------------------------------------------------
+def log(text):
+    try:
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        with open(LOG, 'a') as f:
+            f.write('%s  %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), text))
+    except OSError:
+        pass
+
+
+def run(args, pw=None, **kw):
+    """Run a program; the password, if any, goes in on stdin only (never on a command line)."""
+    try:
+        return subprocess.run(args, input=(pw + '\n') if pw is not None else None, text=True,
+                              capture_output=True, timeout=kw.pop('timeout', 30), **kw)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(args, 99, '', str(e))
+
+
+def seconds(etime):
+    """ps elapsed time [[dd-]hh:]mm:ss -> seconds."""
+    days, _, rest = etime.rpartition('-')
+    parts = [int(p) for p in rest.split(':')]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def processes():
+    out = []
+    for line in run([PS, '-axww', '-o', 'pid=,ppid=,user=,etime=,command=']).stdout.splitlines():
+        bits = line.split(None, 4)
+        if len(bits) == 5 and bits[0].isdigit():
+            try:
+                out.append(dict(pid=int(bits[0]), ppid=int(bits[1]), user=bits[2], age=seconds(bits[3]), cmd=bits[4]))
+            except ValueError:
+                continue
+    return out
+
+
+def read_time(path):
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        with open(path) as f:
+            text = f.read(12).strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() and len(text) <= 10 else None
+
+
+def write_time(path, epoch):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix='.time-')
+    with os.fdopen(fd, 'w') as f:
+        f.write('%d\n' % epoch)
+    os.replace(tmp, path)  # all at once: a loop never reads half a number
+
+
+def read_end():
+    return read_time(DEADLINE)
+
+
+def write_end(epoch):
+    write_time(DEADLINE, epoch)
+
+
+def sleep_disabled():
+    m = re.search(r'SleepDisabled\s+(\d)', run([PMSET, '-g']).stdout)
+    return bool(m and m.group(1) == '1')
+
+
+def lock_off():
+    r = run([SYSADMINCTL, '-screenLock', 'status'])
+    return 'screenLock is off' in (r.stdout + r.stderr)
+
+
+def status():
+    """Everything lfg needs to know, read from the Mac itself (live processes + the lid-sleep setting)."""
+    now, me = time.time(), pwd.getpwuid(os.getuid()).pw_name
+    procs = processes()
+    mine = lambda p, name: p['cmd'].startswith(SH + ' -c ') and (' %s %s ' % (name, DEADLINE)) in p['cmd']
+    s = dict(now=now, admin=[p for p in procs if p['user'] == ROOT and mine(p, 'lfg-root')],
+             awake=[p for p in procs if p['user'] == me and mine(p, 'lfg-user')],
+             sleep_off=sleep_disabled(), lock_off=lock_off(), end=read_end())
+    s['started'] = None
+    if s['admin'] and s['end'] and s['end'] > now:
+        s['kind'], s['until'] = 'on', s['end']
+        first = read_time(STARTED)
+        loop = now - max(p['age'] for p in s['admin'])
+        s['started'] = first if first and first <= now else loop
+    elif s['sleep_off']:
+        s['kind'], s['until'] = 'stuck', None
+    else:
+        s['kind'], s['until'] = 'off', None
+    return s
+
+
+def describe(s, out=None):
+    if s['kind'] == 'on':
+        left = s['until'] - s['now']
+        say('✦', 'lfg is on until ' + clock(s['until'], s['now']), span(left) + ' left', out=out)
+        aside('Started %s, %s ago' % (since(s['started'], s['now']), span(s['now'] - s['started'])), out)
+        if not s['sleep_off']:
+            aside('But lid sleep is back ON: something else changed it. lfg 0, then lfg, sets it right.', out)
+    elif s['kind'] == 'stuck':
+        say('!', 'Lid sleep is off and nothing will turn it back on', style=colour(AMBER), out=out)
+        aside('Left over from an earlier run, or set by something else. lfg starts a fresh run; lfg off puts it back.', out)
+    else:
+        say('·', 'lfg is off', 'lfg = 3 hours, lfg 6 = 6 hours', style='2', out=out)
+    if s['kind'] in ('off', 'stuck') and s['lock_off']:
+        say('!', 'The screen lock is still off', 'lfg off turns it back on', style=colour(AMBER), out=out)
+
+
+# ---- the password, once ----------------------------------------------------------------------------------
+class NoTerminal(Exception):
+    pass
+
+
+def ask(prompt):
+    """Read the password from the terminal itself, never from piped input. getpass puts echo back even on
+    Ctrl-C."""
+    try:
+        os.close(os.open('/dev/tty', os.O_RDWR))
+    except OSError:
+        raise NoTerminal
+    return getpass.getpass(prompt)
+
+
+def is_admin():
+    """In the admin group (sudo works for admins only, out of the box). If id can't tell, let sudo decide."""
+    r = run([ID, '-Gn'])
+    return r.returncode != 0 or 'admin' in r.stdout.split()
+
+
+def password(why, more=''):
+    """His Mac password, checked with sudo before anything changes. None if he gave up."""
+    if not is_admin():
+        say('!', 'lfg needs an admin account on this Mac', 'yours is a standard account · nothing changed',
+            style=colour(AMBER))
+        aside('Keeping the Mac awake with the lid shut is a setting only an admin can change.')
+        return None
+    say('✦', why)
+    if more:
+        aside(more)
+    for left in range(TRIES, 0, -1):
+        pw = ask('     Mac password: ')
+        if run([SUDO, '-S', '-p', '', '-k', '-v'], pw).returncode == 0:
+            # -k first: the check really checks this password, not a sudo still remembered from earlier
+            log('password ok')
+            return pw
+        log('password refused')
+        if left > 1:
+            say('!', "That password didn't work", '%d more %s' % (left - 1, 'try' if left == 2 else 'tries'),
+                style=colour(AMBER))
+    say('!', 'Password not accepted', 'nothing changed', style=colour(AMBER))
+    return None
+
+
+# ---- doing it --------------------------------------------------------------------------------------------
+class Busy:
+    """Ctrl-C waits while the Mac's settings are being changed, so a run is never left half made."""
+
+    def __enter__(self):
+        self.old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self.old)
+
+
+def wait_for(test, secs=5):
+    stop = time.time() + secs
+    while time.time() < stop:
+        s = status()
+        if test(s):
+            return s
+        time.sleep(0.25)
+    return status()
+
+
+def screen_lock(pw, on):
+    """Screen lock on (immediate) or off, with the password on stdin. Judged by reading it back; if the piped
+    password was not taken, sysadminctl asks in the terminal itself."""
+    want = 'immediate' if on else 'off'
+    if lock_off() != on:
+        return True
+    r = run([SYSADMINCTL, '-screenLock', want, '-password', '-'], pw)
+    log('screen lock %s: exit %d' % (want, r.returncode))
+    if lock_off() != on:
+        return True
+    say('!', 'The screen lock needs your password once more', 'macOS did not take it the first time',
+        style=colour(AMBER))
+    try:
+        subprocess.run([SYSADMINCTL, '-screenLock', want, '-password', '-'], stdin=open('/dev/tty'), timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return lock_off() != on
+
+
+def start(end, pw):
+    """Make lfg run until `end`. Reads the Mac afresh: what was on screen before the password may be stale.
+    The admin loop comes first, so lid sleep is only switched off once something will switch it back on.
+    Returns the status afterwards; the caller reports from that, never from what it hoped."""
+    s = status()
+    if (s['admin'] or s['awake']) and s['kind'] != 'on':
+        # Loops whose end has passed (or that were told to stop) are about to finish and put sleep back.
+        # Let them go first, so their "sleep back on" cannot land after this run's "sleep off".
+        s = wait_for(lambda x: not x['admin'] and not x['awake'], TICK + 10)
+    write_end(end)
+    log('end set to %s' % clock(end))
+    # When this run began: carried over from a run already going, else now.
+    write_time(STARTED, int(s['started'] if s['kind'] == 'on' and s['started'] else time.time()))
+    if not s['admin']:
+        subprocess.run([SUDO, '-S', '-p', '', '-b', SH, '-c', ROOT_LOOP, 'lfg-root', DEADLINE, str(TICK), str(end),
+                        PMSET, str(MAX_HOURS * 3600)], input=pw + '\n', text=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, start_new_session=True, timeout=30)
+        if not wait_for(lambda x: x['admin'])['admin']:
+            log('admin loop did not start: nothing else changed')
+            return status()
+    r = run([SUDO, '-S', '-p', '', PMSET, '-a', 'disablesleep', '1'], pw)
+    log('lid sleep off: exit %d' % r.returncode)
+    if not s['awake']:
+        subprocess.Popen([SH, '-c', USER_LOOP, 'lfg-user', DEADLINE, str(TICK), str(end), CAFFEINATE,
+                          str(MAX_HOURS * 3600), OSASCRIPT, 'tell application "Terminal" to activate', RELOCK],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    screen_lock(pw, on=False)
+    new = wait_for(lambda x: x['admin'] and x['awake'] and x['sleep_off'])
+    log('loops: admin %s, awake %s, lid sleep off %s, screen lock off %s'
+        % (bool(new['admin']), bool(new['awake']), new['sleep_off'], new['lock_off']))
+    return new
+
+
+def turn_off(pw):
+    write_end(0)  # the loops see 0 at their next look and end quietly (no lock window)
+    r = run([SUDO, '-S', '-p', '', PMSET, '-a', 'disablesleep', '0'], pw)
+    log('off: lid sleep back on, exit %d' % r.returncode)
+    screen_lock(pw, on=True)
+    return status()
+
+
+# ---- the choice when it is already on ----------------------------------------------------------------
+def choices(s):
+    base = s['until']
+    return [('add', 3, 'Add 3 hours', 'until ' + clock(base + 3 * 3600, s['now'])),
+            ('add', 6, 'Add 6 hours', 'until ' + clock(base + 6 * 3600, s['now'])),
+            ('custom', None, 'Custom…', 'type how many hours to add'),
+            ('off', 0, 'Turn it off now', 'sleep and screen lock come back · asks your password'),
+            ('leave', 0, 'Leave it as it is', '')]
+
+
+def press(n, at, key):
+    """One key in the list -> (highlighted row, 'go' | 'quit' | None)."""
+    if key in ('up', 'k', 'down', 'j'):
+        return (at + (-1 if key in ('up', 'k') else 1)) % n, None
+    if key == 'enter':
+        return at, 'go'
+    if key in ('esc', 'q'):
+        return at, 'quit'
+    if len(key) == 1 and key.isdigit() and 1 <= int(key) <= n:
+        return int(key) - 1, 'go'
+    return at, None
+
+
+def custom_hours(s, typed):
+    """What he has typed into Custom -> (hours or None, problem or '')."""
+    if not typed:
+        return None, ''
+    try:
+        h = float(typed)
+    except ValueError:
+        return None, 'a number of hours, e.g. 2 or 1.5'
+    room = (s['now'] + MAX_HOURS * 3600 - s['until']) / 3600
+    if not 0 < h:
+        return None, 'more than 0'
+    if h > room:
+        return None, 'at most %g more (lfg runs up to %d hours ahead)' % (int(room * 10) / 10, MAX_HOURS)
+    return h, ''
+
+
+def type_key(typed, key):
+    """One key while typing into Custom -> (typed, 'go' | 'back' | None)."""
+    if key == 'enter':
+        return typed, 'go'
+    if key in ('esc', 'up', 'down'):
+        return typed, 'back'
+    if key in ('\x7f', '\x08'):
+        return typed[:-1], None
+    if len(key) == 1 and (key.isdigit() or key == '.') and len(typed) < 5:
+        return typed + key, None
+    return typed, None
+
+
+def head(s, cols):
+    """The top of the list: where the run stands."""
+    teal = colour(TEAL)
+    left, gone = s['until'] - s['now'], s['now'] - s['started']
+    width = max(10, min(40, cols - 18))
+    rows = [[], [('  ✦  ', teal), ('lfg is on', '1')], [],
+            [('     Started  ', '2'), ('%-16s' % since(s['started'], s['now']), ''), (span(gone) + ' ago', '2')],
+            [('     Ends     ', '2'), ('%-16s' % clock(s['until'], s['now']), ''), (span(left) + ' left', teal + ';1')],
+            [('     ', '')] + bar(gone / max(left + gone, 1), width)
+            + [('  %d%% done' % round(100 * gone / max(left + gone, 1)), '2')]]
+    return rows
+
+
+def frame(s, rows, at, cols, typing=None):
+    teal = colour(TEAL)
+    out = head(s, cols) + [[]]
+    for i, (kind, _, label, note) in enumerate(rows):
+        on = i == at
+        lead = [('  ❯ ' if on else '    ', teal + ';1'), ('%d  ' % (i + 1), teal if on else '2')]
+        if kind == 'custom' and on and typing is not None:
+            h, problem = custom_hours(s, typing)
+            box = ' %s▏' % typing
+            entry = [('Add', '1'), (box, teal + ';1'), (' hours'.ljust(18 - 3 - len(box)), '1')]  # 18 = label column
+            tail = (problem, colour(AMBER)) if problem else \
+                ('until ' + clock(s['until'] + h * 3600, s['now']), '2') if h else ('type a number, e.g. 2 or 1.5', '2')
+            out.append(lead + entry + [tail])
+            continue
+        out.append(lead + [('%-18s' % label, '1' if on else ''), (note, '2')])
+    hint = '  Type the hours  ·  Enter add  ·  Esc back' if typing is not None else \
+        '  ↑ ↓ move  ·  Enter choose  ·  or press its number  ·  Esc leave it'
+    out += [[], [(hint, '2')]]
+    return out
+
+
+def paint(pieces, cols):
+    left, out = cols - 1, ''
+    for text, style in pieces:
+        text = text[:max(left, 0)]
+        left -= len(text)
+        if text:
+            out += '\x1b[%sm%s\x1b[0m' % (style, text) if style and not os.environ.get('NO_COLOR') else text
+    return out
+
+
+class Menu:
+    """The choice, drawn on the terminal itself (/dev/tty) on its spare screen, so the shell looks untouched
+    afterwards. Raises OSError / termios.error when there is no terminal."""
+
+    def __init__(self):
+        self.fd = os.open('/dev/tty', os.O_RDWR)
+        self.old = termios.tcgetattr(self.fd)
+        try:
+            tty.setcbreak(self.fd)
+            mode = termios.tcgetattr(self.fd)
+            off = bytes([os.fpathconf(self.fd, 'PC_VDISABLE')])
+            for k in ('VSUSP', 'VDSUSP', 'VQUIT'):  # Ctrl-Z / Ctrl-\ would leave this screen stuck up
+                if hasattr(termios, k):
+                    mode[6][getattr(termios, k)] = off
+            termios.tcsetattr(self.fd, termios.TCSANOW, mode)
+            os.write(self.fd, b'\x1b[?1049h\x1b[?25l')
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.fd is None:
+            return
+        os.write(self.fd, b'\x1b[?25h\x1b[?1049l')
+        termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.old)
+        os.close(self.fd)
+        self.fd = None
+
+    def key(self):
+        b = os.read(self.fd, 1)
+        if b in (b'\r', b'\n'):
+            return 'enter'
+        if b in (b'', b'\x04', b'\x03'):
+            return 'esc'
+        if b != b'\x1b':
+            return b.decode('latin-1')
+        seq = b''  # an arrow is Esc + more bytes at once; read the whole code so its digits are not row numbers
+        while select.select([self.fd], [], [], 0.05)[0]:
+            seq += os.read(self.fd, 1)
+            if len(seq) > 1 and 0x40 <= seq[-1] <= 0x7e:
+                break
+        if not seq:
+            return 'esc'
+        return {b'A': 'up', b'B': 'down'}.get(seq[-1:], '') if seq[:1] in (b'[', b'O') else ''
+
+    def choose(self, s, rows):
+        termios.tcflush(self.fd, termios.TCIFLUSH)  # keys typed before the list showed are dropped
+        at, typing = 0, None  # typing: what he has typed into Custom, or None while moving in the list
+        while True:
+            cols = os.get_terminal_size(self.fd).columns
+            lines = frame(s, rows, at, cols, typing)
+            os.write(self.fd, ('\x1b[H\x1b[J' + '\r\n'.join(paint(l, cols) for l in lines)).encode())
+            key = self.key()
+            if typing is not None:
+                typing, act = type_key(typing, key)
+                if act == 'back':
+                    typing = None
+                elif act == 'go':
+                    h = custom_hours(s, typing)[0]
+                    if h:
+                        return ('add', h, 'Add %g hours' % h, '')
+                continue
+            at, act = press(len(rows), at, key)
+            if act == 'go' and rows[at][0] == 'custom':
+                typing = ''
+            elif act:
+                return rows[at] if act == 'go' else None
+
+
+def pick(s):
+    try:
+        menu = Menu()
+    except (OSError, termios.error):
+        return None
+    try:
+        return menu.choose(s, choices(s))
+    finally:
+        menu.close()
+
+
+# ---- main ------------------------------------------------------------------------------------------------
+def parse(args):
+    """-> (what, hours). what: start | add | off | status | help | bad."""
+    if not args:
+        return 'start', None
+    a = args[0].lower()
+    if a in ('status', 's', '?'):
+        return 'status', None
+    if a in ('off', 'stop', '0'):
+        return 'off', None
+    if a in ('help', '-h', '--help'):
+        return 'help', None
+    if a in ('version', '--version', '-v'):
+        return 'version', None
+    if a in ('update', 'uninstall', 'installed'):
+        return a, None
+    add = a.startswith('+')
+    try:
+        h = float(a[1:] if add else a)
+    except ValueError:
+        return 'bad', None
+    if not 0 < h <= MAX_HOURS or h != h:
+        return 'bad', h
+    return ('add' if add else 'start'), h
+
+
+def finish_on(s, verb):
+    say('✓', '%s until %s' % (verb, clock(s['until'], s['now'])), span(s['until'] - s['now']) + ' left')
+    aside('Lid shut is fine. Run lfg again to extend or turn it off.')
+    if not s['lock_off']:
+        say('!', 'The screen lock is still on', 'the Mac will lock when idle', style=colour(AMBER))
+
+
+def report(new, verb, failed):
+    """Say what is true now (read from the Mac), not what was meant to happen."""
+    if new['kind'] == 'on' and new['sleep_off']:
+        finish_on(new, verb)
+        return 0
+    say('!', failed, style=colour(AMBER))
+    describe(new)
+    aside('What happened is in ~/.lfg/log')
+    return 1
+
+
+def extend(end):
+    """Already running (new style): a later end time is all it takes. No password."""
+    write_end(end)
+    log('extended to %s' % clock(end))
+    return report(status(), 'Extended', 'Could not extend')
+
+
+def locked(fn):
+    """One lfg at a time: a second window waits for nothing and says so."""
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(os.path.join(STATE, 'lock'), 'w') as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            say('!', 'lfg is busy in another window', 'try again in a moment', style=colour(AMBER))
+            return 1
+        return fn()
+
+
+def main(args=None):
+    args = sys.argv[1:] if args is None else args
+    what, hours = parse(args)
+    if what == 'help':
+        print(__doc__.strip().split('\n\nYour Mac')[0])
+        return 0
+    if what == 'bad':
+        say('!', 'lfg takes a number of hours (up to %d), +hours, off or status' % MAX_HOURS, 'e.g. lfg 6',
+            style=colour(AMBER))
+        return 2
+    if what == 'status':
+        describe(status())
+        return 0
+    if what == 'version':
+        print('lfg ' + VERSION)
+        return 0
+    if what in ('update', 'uninstall', 'installed'):
+        return {'update': update, 'uninstall': uninstall, 'installed': installed}[what](args[1:])
+    try:
+        return locked(lambda: act(what, hours, status()))
+    except NoTerminal:
+        say('!', 'This needs your Mac password', 'run lfg in Terminal', style=colour(AMBER))
+        return 1
+    except KeyboardInterrupt:  # only possible at the password or the list: changes are made with Ctrl-C held
+        print()
+        say('·', 'Stopped', 'nothing changed', style='2')
+        return 130
+
+
+# ---- install, update, remove ----------------------------------------------------------------------------
+def installed(args):
+    """What the installer shows at the end of a first install."""
+    say('✦', 'lfg %s is installed' % VERSION)
+    aside('Type lfg to keep this Mac awake with the lid shut for 3 hours.')
+    aside('lfg 6 = 6 hours · lfg status · lfg off · lfg help')
+    return 0
+
+
+def update(args):
+    """`lfg update`: fetch the newest lfg.sh and run it over this one. A run that is on keeps going."""
+    print('lfg: checking for a newer lfg…', file=sys.stderr)
+    try:
+        body = urllib.request.urlopen(LATEST + '?v=%d' % time.time(), timeout=20).read()
+    except Exception as e:
+        print("lfg update: couldn't reach GitHub (%s). Nothing changed." % (getattr(e, 'reason', None) or e),
+              file=sys.stderr)
+        return 1
+    found = re.search(rb"^VERSION = '([0-9.]+)'$", body, re.M)
+    if not (body.startswith(b'#!/usr/bin/env bash') and b'LFG_PROGRAM_END' in body and found):
+        print("lfg update: what came back doesn't look like lfg. Nothing changed.", file=sys.stderr)
+        return 1
+    new = found.group(1).decode()
+    number = lambda v: tuple(int(x) for x in v.split('.') if x.isdigit())
+    if number(new) <= number(VERSION) and '--force' not in args:
+        print('lfg: you have the newest, %s' % VERSION)
+        return 0
+    fd, path = tempfile.mkstemp(suffix='.sh')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(body)
+        code = subprocess.run(['/bin/bash', path], env=dict(os.environ, LFG_QUIET='1'), stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL).returncode
+    finally:
+        os.unlink(path)
+    if code:
+        print('lfg update: the update did not finish. The lfg you had still works.', file=sys.stderr)
+        return 1
+    print('lfg: updated %s → %s' % (VERSION, new))
+    return 0
+
+
+def uninstall(args):
+    """`lfg uninstall`: remove the program, its command and ~/.lfg. Refused while a run is on, so nothing is
+    left with lid sleep off and no one to turn it back on."""
+    s = status()
+    if s['kind'] == 'on' or s['admin'] or s['awake']:
+        say('!', 'lfg is on right now', 'turn it off first: lfg off · then lfg uninstall', style=colour(AMBER))
+        return 1
+    me = os.path.realpath(os.path.join(SHARE, 'lfg'))
+    for d in os.environ.get('PATH', '').split(':') + [os.path.join(HOME, '.local', 'bin')]:
+        p = os.path.join(d, 'lfg')
+        if d and os.path.islink(p) and os.path.realpath(p) == me:
+            os.unlink(p)
+    shutil.rmtree(SHARE, ignore_errors=True)
+    shutil.rmtree(STATE, ignore_errors=True)
+    say('✓', 'lfg is removed')
+    if s['kind'] == 'stuck':
+        say('!', 'Lid sleep is still off on this Mac', 'turn it back on: sudo pmset -a disablesleep 0',
+            style=colour(AMBER))
+    return 0
+
+
+def act(what, hours, s):
+    running = s['kind'] == 'on'
+    if what == 'off':
+        if s['kind'] == 'off' and not s['lock_off']:
+            describe(s)
+            return 0
+        pw = password('Turn lfg off · sleep and the screen lock come back')
+        if pw is None:
+            return 1
+        with Busy():
+            new = turn_off(pw)
+        del pw
+        if not new['sleep_off'] and not new['lock_off']:
+            say('✓', 'lfg is off · sleep and the screen lock are back to normal')
+            return 0
+        left = [w for w, bad in (('lid sleep is still off', new['sleep_off']),
+                                 ('the screen lock is still off', new['lock_off'])) if bad]
+        say('!', 'Turned off, but ' + ' and '.join(left), 'see ~/.lfg/log', style=colour(AMBER))
+        return 1
+
+    if running and hours is None:  # plain `lfg` while it is on: say so, offer to extend or stop
+        choice = pick(s)
+        if choice is None:
+            describe(s)
+            return 0
+        kind, h, _, _ = choice
+        if kind == 'leave':
+            describe(s)
+            return 0
+        if kind == 'off':
+            return act('off', None, s)
+        now = status()  # the list may have been open a while: add to the end as it is NOW
+        base = now['until'] if now['kind'] == 'on' else time.time()
+        return grow(base + h * 3600)
+
+    if running:
+        end = s['until'] + hours * 3600 if what == 'add' else s['now'] + hours * 3600
+        if end <= s['until']:
+            say('✦', 'Already on until %s' % clock(s['until'], s['now']),
+                'later than %s from now · nothing changed · lfg +%g adds time' % (hours_words(hours), hours))
+            return 0
+        return grow(end)
+
+    hours = hours or DEFAULT_HOURS
+    end = int(s['now'] + hours * 3600)
+    pw = password('lfg · keep the Mac awake with the lid shut until %s (%s)' % (clock(end, s['now']),
+                                                                              hours_words(hours)),
+                  'Lid sleep was left off by an earlier lfg; this sorts that out too.' if s['kind'] == 'stuck' else '')
+    if pw is None:
+        return 1
+    with Busy():
+        new = start(end, pw)
+    del pw
+    return report(new, 'On', 'Could not start lfg')
+
+
+def grow(end):
+    end = int(end)
+    if end - time.time() > MAX_HOURS * 3600:
+        say('!', 'That is more than %d hours from now' % MAX_HOURS, 'nothing changed', style=colour(AMBER))
+        return 2
+    s = status()
+    if s['kind'] == 'on' and s['until'] - time.time() > 5:
+        return extend(end)
+    # Ending this very moment, or already ended: starting again needs the password.
+    why = 'It was just ending, so this needs your password.' if s['kind'] == 'on' else \
+        'It ended while you were choosing, so this starts it again.'
+    pw = password('Keep the Mac awake until %s' % clock(end, s['now']), why)
+    if pw is None:
+        return 1
+    with Busy():
+        new = start(end, pw)
+    del pw
+    return report(new, 'Extended', 'Could not extend')
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+LFG_PROGRAM_END
+} > "${SHARE}/lfg.new"
+"$PY" -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "${SHARE}/lfg.new" 2>/dev/null \
+  || { rm -f "${SHARE}/lfg.new"; fail "this file is damaged (cut short?); get a fresh copy of lfg.sh"; }
+chmod 755 "${SHARE}/lfg.new"
+"${SHARE}/lfg.new" --version >/dev/null 2>&1 </dev/null \
+  || { rm -f "${SHARE}/lfg.new"; fail "lfg didn't start with ${PY}; nothing was changed"; }
+mv -f "${SHARE}/lfg.new" "${SHARE}/lfg"
+
+# A folder already on PATH, so lfg works in this terminal straight away.
+BIN=""
+for d in "${HOME}/.local/bin" /opt/homebrew/bin /usr/local/bin "${HOME}/bin"; do
+  case ":${PATH}:" in
+    *":${d}:"*) if [ -d "$d" ] && [ -w "$d" ]; then BIN="$d"; break; fi ;;
+  esac
+done
+NEW_TAB=""
+if [ -z "$BIN" ]; then  # none: ~/.local/bin, and a PATH line for it unless their settings have one
+  BIN="${HOME}/.local/bin"
+  mkdir -p "$BIN"
+  RC="${HOME}/.zshrc"
+  case "${SHELL:-}" in */bash) RC="${HOME}/.bash_profile" ;; esac
+  if ! grep -Eqs '^[^#]*PATH=.*\.local/bin' "$RC"; then
+    printf '\n# lfg\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
+  fi
+  NEW_TAB=1
+fi
+
+BLOCKED=""
+t="${BIN}/lfg"
+if { [ -e "$t" ] || [ -L "$t" ]; } && { [ ! -L "$t" ] || [ "$(readlink "$t")" != "${SHARE}/lfg" ]; }; then
+  note "lfg install: ${t} is another program, so it was left alone: typing lfg won't reach this one."
+  BLOCKED=1
+else
+  ln -sfn "${SHARE}/lfg" "$t"
+fi
+
+# Their own alias or function called lfg would win over the program.
+for rc in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.zprofile"; do
+  if grep -Eqs '^[[:space:]]*(alias[[:space:]]+lfg=|(function[[:space:]]+)?lfg[[:space:]]*\(\))' "$rc"; then
+    note "lfg install: ${rc/#$HOME/~} has its own lfg alias or function, which wins over this one. Remove it to use this lfg."
+  fi
+done
+
+if [ -z "${LFG_QUIET:-}" ]; then  # not on an update
+  "${SHARE}/lfg" installed </dev/null || true
+fi
+if [ -n "$BLOCKED" ]; then
+  note "To use lfg anyway, run it by its full path: ${SHARE}/lfg"
+fi
+if [ -n "$NEW_TAB" ]; then
+  note "Open a new terminal tab for lfg to be found."
+fi
