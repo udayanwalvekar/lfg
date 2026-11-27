@@ -2,19 +2,48 @@
 """lfg tests. Everything that would touch the Mac (sudo, pmset, sysadminctl, caffeinate, osascript, ps, kill)
 (and id) is a stand-in script in a throwaway folder that only writes to a log. The tests refuse to run if any of them
 resolves to the real program. Run: python3 -I tests/test_lfg.py"""
-import io, os, pwd, re, shutil, signal, subprocess, sys, tempfile, time, unittest, warnings
+import importlib.util, io, os, pwd, re, shutil, signal, subprocess, sys, tempfile, time, unittest, warnings
 warnings.simplefilter('ignore', ResourceWarning)  # the background loops are meant to outlive lfg
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from unittest import mock
 
-lfg = SourceFileLoader('lfg', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lfg')).load_module()
+def load(name, path):
+    """A copy of lfg as a module (it has no .py name, so its loader is given by hand)."""
+    spec = importlib.util.spec_from_loader(name, SourceFileLoader(name, path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+lfg = load('lfg', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lfg'))
 ME = pwd.getpwuid(os.getuid()).pw_name
 PW = 'testpw'
 
 STUBS = {
     'sudo': r'''#!/bin/bash
 D="$LFG_TEST_DIR"
+if [ "$1" = "-k" ] && [ $# -eq 1 ]; then echo "sudo -k" >> "$D/calls.log"; exit 0; fi
+if [ "$1" = "-n" ]; then
+  # Like sudoers: only the exact commands listed after NOPASSWD in this account's rule, and only if sudo reads
+  # the folder (no_includedir = it doesn't) and the rule names this account.
+  shift
+  rule="$D/sudoers.d/lfg-$(/usr/bin/id -u)"
+  if [ -f "$rule" ] && [ ! -f "$D/no_includedir" ]; then
+    line="$(grep -v '^#' "$rule" | grep NOPASSWD)"
+    who="${line%% *}"
+    if [ "$who" = "$(/usr/bin/id -un)" ] || [ "$who" = "#$(/usr/bin/id -u)" ]; then
+      IFS=',' read -ra cmds <<< "${line#*NOPASSWD: }"
+      for c in "${cmds[@]}"; do
+        c="${c# }"
+        if [ "$c" = "$*" ]; then echo "sudo-n $*" >> "$D/calls.log"; exec "$@"; fi
+      done
+    fi
+  fi
+  echo "sudo-n-refused $*" >> "$D/calls.log"
+  echo "sudo: a password is required" >&2
+  exit 1
+fi
 IFS= read -r pw || pw=""
 if [ "$1" != "-S" ] || [ "$2" != "-p" ]; then echo "BADARGS $*" >> "$D/calls.log"; exit 2; fi
 shift 3
@@ -36,6 +65,7 @@ esac
     'sysadminctl': r'''#!/bin/bash
 D="$LFG_TEST_DIR"
 if [ "$2" = status ]; then
+  echo "sysadminctl $*" >> "$D/reads.log"
   v="$(cat "$D/lock" 2>/dev/null)"
   case "$v" in
     off) echo "x sysadminctl[1:2] screenLock is off" >&2;;
@@ -73,7 +103,37 @@ cat "$LFG_TEST_DIR/download" 2>/dev/null || { echo "curl: (6) Could not resolve 
     'id': r'''#!/bin/bash
 cat "$LFG_TEST_DIR/groups" 2>/dev/null || echo "staff everyone admin"
 ''',
+    # visudo -c -q -f FILE: like the real one, refuses a file that isn't read-only or isn't exactly lfg's rule
+    # shape. visudo -c -q: the whole setup (visudo_full_fail = it fails).
+    'visudo': r'''#!/bin/bash
+D="$LFG_TEST_DIR"
+echo "visudo $*" >> "$D/calls.log"
+if [ "$1 $2 $3" = "-c -q -f" ]; then
+  [ -f "$D/visudo_fail" ] && exit 1  # refuses lfg's file
+  [ "$(stat -f %Lp "$4")" = 440 ] || exit 1
+  [ "$(grep -c . "$4")" = 2 ] || exit 1
+  head -n 1 "$4" | grep -q '^# ' || exit 1
+  tail -n 1 "$4" | grep -Eqx '(#[0-9]+|[A-Za-z_][A-Za-z0-9_.-]*) ALL = \(root\) NOPASSWD: (/[^ ,]+) -a disablesleep 1, \2 -a disablesleep 0' || exit 1
+  exit 0
+fi
+if [ "$1 $2" = "-c -q" ] && [ $# -eq 2 ]; then
+  [ -f "$D/visudo_broken" ] && exit 1  # broken before lfg came
+  [ -f "$D/visudo_full_fail" ] && ls "$D/sudoers.d" | grep -qv '[.]' && exit 1  # broken with lfg's rule in
+  exit 0
+fi
+exit 2
+''',
+    # chown 0:0 FILE: can't really hand a file to root here; it only says so.
+    'chown': r'''#!/bin/bash
+echo "chown $*" >> "$LFG_TEST_DIR/calls.log"
+[ "$1" = "0:0" ] && [ -f "$2" ]
+''',
 }
+
+
+# Every path lfg would touch outside Python itself. Each must point into the sandbox, or no test runs.
+SANDBOXED = ('SUDO', 'PMSET', 'SYSADMINCTL', 'CAFFEINATE', 'OSASCRIPT', 'PS', 'ID', 'CURL', 'VISUDO', 'CHOWN',
+             'SUDOERS_D', 'STATE', 'DEADLINE', 'LOG', 'STARTED', 'LOCK_BEFORE', 'ASKED', 'SHARE', 'HOME')
 
 
 class Sandbox(unittest.TestCase):
@@ -92,13 +152,14 @@ class Sandbox(unittest.TestCase):
             lfg, SUDO=b + 'sudo', PMSET=b + 'pmset', SYSADMINCTL=b + 'sysadminctl', CAFFEINATE=b + 'caffeinate',
             OSASCRIPT=b + 'osascript', PS=b + 'ps', ID=b + 'id', ROOT=ME, TICK=1,
             STATE=state, DEADLINE=state + '/until', LOG=state + '/log', STARTED=state + '/started', LOCK_BEFORE=state + '/lock-before',
-            CURL=b + 'curl',
+            CURL=b + 'curl', ASKED=state + '/setup-asked',
+            SUDOERS_D=self.d + '/sudoers.d', VISUDO=b + 'visudo', CHOWN=b + 'chown',
             SHARE=self.d + '/share', HOME=self.d + '/home')]
+        os.makedirs(self.d + '/sudoers.d')
         for p in self.patches:
             p.start()
         # Fail closed: nothing below may run if a real program would be used.
-        for name in ('SUDO', 'PMSET', 'SYSADMINCTL', 'CAFFEINATE', 'OSASCRIPT', 'PS', 'ID', 'CURL', 'STATE', 'DEADLINE',
-                     'LOG', 'STARTED', 'LOCK_BEFORE', 'SHARE', 'HOME'):
+        for name in SANDBOXED:
             if not getattr(lfg, name).startswith(self.d + '/'):
                 raise SystemExit('refusing to run: %s is not the sandbox stand-in' % name)
         self.write('sleepdisabled', '0')
@@ -558,6 +619,739 @@ class Stuck(Sandbox):
         self.assertIn('nothing will turn it back on', self.out)
         self.assertEqual(self.lfg('1'), 0, self.out)
         self.assertEqual(lfg.status()['kind'], 'on')
+
+
+class FakeMenu:
+    """The terminal question, answered by the test: `picks` are the rows chosen, in order. Showing a question the
+    test didn't expect fails it (IndexError), and so does the run picker."""
+
+    def __init__(self, picks=()):
+        self.picks, self.shown = list(picks), []
+
+    def __call__(self):  # stands in for the Menu class: Menu() -> this
+        return self
+
+    def question(self, title, notes, rows, hint):
+        self.shown.append((title, notes, rows, hint))
+        return self.picks.pop(0)
+
+    def choose(self, s, rows):
+        raise AssertionError('the run picker showed')
+
+    def close(self):
+        pass
+
+
+class NoPassword(Sandbox):
+    """lfg setup: the password one last time, then never; the screen lock is never touched."""
+
+    def rule(self):
+        return '%s/sudoers.d/lfg-%d' % (self.d, os.getuid())
+
+    def lfg(self, *args):
+        rc = super().lfg(*args)
+        for l in self.out.replace(self.d + '/sudoers.d', '/etc/sudoers.d').splitlines():  # paths as on a real Mac
+            self.assertLess(len(l), 80, 'cut at the edge of an 80-column window: %r' % l)
+        return rc
+
+    def at_terminal(self, picks=()):
+        """A person at a terminal who will answer the question with `picks`."""
+        self.fake = FakeMenu(picks)
+        for p in (mock.patch.object(lfg, 'Menu', self.fake), mock.patch.object(lfg, 'can_ask', return_value=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def set_up_free(self):
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 0, self.out)
+        self.assertTrue(os.path.exists(self.rule()))
+        self.asked.clear()
+        self.answers = [AssertionError('asked for a password')]  # from here on, any password prompt fails the test
+        self.mark = len(self.calls())
+        os.remove(self.d + '/reads.log')  # the screen lock reads from before the rule
+
+    def solo(self):
+        return len(lfg.status()['solo'])
+
+    def since_setup(self):
+        return self.calls()[self.mark:]
+
+    def screen_lock_untouched(self):
+        self.assertFalse([c for c in self.since_setup() if c.startswith(('sysadminctl', 'osascript'))], self.calls())
+        self.assertEqual(self.read('reads.log'), '')  # not even read
+        self.assertEqual(self.read('lock').strip(), 'immediate')
+
+    def test_setup_yes_adds_exactly_the_rule_and_asks_once(self):
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 0, self.out)
+        self.assertEqual(len(self.asked), 1)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        pmset = self.d + '/bin/pmset'
+        with open(self.rule()) as f:
+            text = f.read()
+        lines = text.splitlines()
+        self.assertEqual(len(lines), 2, text)
+        self.assertTrue(lines[0].startswith('# lfg (github.com/udayanwalvekar/lfg) lets '), lines[0])
+        self.assertEqual(lines[1], '%s ALL = (root) NOPASSWD: %s -a disablesleep 1, %s -a disablesleep 0'
+                         % (me, pmset, pmset))
+        self.assertEqual(oct(os.stat(self.rule()).st_mode & 0o777), '0o440')
+        self.assertNotIn('.', os.path.basename(self.rule()))  # sudo skips names with a dot: this one it reads
+        self.assertEqual(os.listdir(self.d + '/sudoers.d'), [os.path.basename(self.rule())])  # no .new left
+        calls = self.calls()
+        new = self.rule() + '.new'
+        # The order that keeps a broken rule out: the sudo setup checked as it is, the rule written as .new, made
+        # root's, checked, moved in, all checked again, then tried for real with no password (after sudo forgets
+        # the password it just took).
+        order = ['visudo -c -q', 'chown 0:0 ' + new, 'visudo -c -q -f ' + new, 'visudo -c -q', 'sudo -k',
+                 'sudo-n %s -a disablesleep 0' % pmset]
+        self.assertEqual([c for c in calls if c.startswith(('chown', 'visudo', 'sudo-n')) or c == 'sudo -k'], order)
+        self.assertFalse([c for c in calls if c.startswith('pmset disablesleep 1')])  # nothing kept awake yet
+        self.assertEqual(self.read('state/setup-asked').split()[0], 'yes')
+        self.assertIn("won't ask for your password again", self.out)
+        self.assertIn('allows only pmset -a disablesleep 1 and 0', self.out)
+        for l in self.out.replace(self.d + '/sudoers.d', '/etc/sudoers.d').splitlines():  # as on a real Mac
+            self.assertLess(len(l), 80, l)
+        title, notes, rows, _ = self.fake.shown[0]
+        words = ' '.join(notes)
+        self.assertIn('turn lid sleep off and on with no password', words)
+        self.assertIn('Any program on this Mac could then keep it awake', words)
+        self.assertIn('Nothing more', words)
+        self.assertIn('screen lock', words)
+        self.assertEqual(title, 'Never ask for your password again?')
+
+    def test_after_setup_start_extend_off_need_no_password_and_leave_the_screen_lock(self):
+        self.set_up_free()
+        t = time.time()
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertIn('On until', self.out)
+        self.assertIn('screen lock is left as you have it', self.out)
+        self.assertNotIn('screen lock is still on', self.out)
+        self.assertAlmostEqual(lfg.read_end(), t + 7200, delta=3)
+        self.assertEqual(self.read('sleepdisabled').strip(), '1')
+        s = lfg.status()
+        self.assertEqual((len(s['admin']), len(s['awake']), len(s['solo'])), (0, 0, 1))  # one loop, his own
+        self.assertEqual(s['solo'][0]['user'], ME)
+        self.assertTrue(self.wait(lambda: any(c.startswith('caffeinate -ims ') for c in self.calls()), 3))
+        self.assertFalse([c for c in self.calls() if c.startswith('caffeinate -d')])  # the display may sleep and lock
+        end = lfg.read_end()
+        self.assertEqual(self.lfg('+1'), 0, self.out)
+        self.assertEqual(lfg.read_end(), end + 3600)
+        self.assertEqual(self.lfg('off'), 0, self.out)
+        self.assertIn('lfg is off', self.out)
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.assertTrue(self.wait(lambda: self.solo() == 0, 5))
+        self.assertTrue(self.wait(lambda: not self.awake_running(), 3))
+        self.assertEqual(self.asked, [])
+        self.screen_lock_untouched()
+        self.assertFalse([c for c in self.since_setup() if c.startswith(('sudo /', 'sudo -b', 'sudo -k'))])
+
+    def test_no_terminal_can_start_and_stop_it(self):
+        """What Alfred (or any agent) needs: no terminal, no password, no question."""
+        self.set_up_free()
+        self.answers = [lfg.NoTerminal]
+        with mock.patch.object(lfg, 'can_ask', return_value=False):
+            self.assertEqual(self.lfg('1'), 0, self.out)
+            self.assertEqual(lfg.status()['kind'], 'on')
+            self.assertEqual(self.lfg('off'), 0, self.out)
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.assertEqual(self.asked, [])
+        self.assertNotIn('\x1b', self.out)
+
+    def test_a_natural_end_turns_lid_sleep_back_on_with_no_window(self):
+        self.set_up_free()
+        self.assertEqual(self.lfg('0.0015'), 0, self.out)  # ~5 s
+        self.assertTrue(self.wait(lambda: self.solo() == 0, 30))
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.assertEqual(len([c for c in self.calls() if c == 'sudo-n %s/bin/pmset -a disablesleep 0' % self.d]), 2)
+        self.assertTrue(self.wait(lambda: not self.awake_running(), 5))
+        time.sleep(1)
+        self.assertFalse([c for c in self.calls() if c.startswith('osascript')])
+        self.assertEqual(lfg.status()['kind'], 'off')
+        self.assertNotIn('NOT back on', self.read('state/log'))
+
+    def test_run_ends_while_the_list_is_open_then_add_restarts_it_with_no_password(self):
+        self.set_up_free()
+        self.lfg('0.002')  # ~7 s
+        def slow_choice(s):
+            self.wait(lambda: self.solo() == 0, 20)
+            return lfg.choices(s)[0]
+        with mock.patch.object(lfg, 'pick', side_effect=slow_choice):
+            self.assertEqual(self.lfg(), 0, self.out)
+        s = lfg.status()
+        self.assertEqual((s['kind'], s['sleep_off'], len(s['solo'])), ('on', True, 1))
+        self.assertEqual(self.asked, [])
+
+    def test_picker_turn_off_needs_no_password(self):
+        self.set_up_free()
+        self.lfg('2')
+        self.assertIn('no password', lfg.choices(lfg.status())[3][3])
+        with mock.patch.object(lfg, 'pick', side_effect=lambda s: lfg.choices(s)[3]):
+            self.assertEqual(self.lfg(), 0, self.out)
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.assertEqual(self.asked, [])
+
+    def test_status_says_no_password_is_needed(self):
+        self.set_up_free()
+        self.lfg('status')
+        self.assertIn('lfg is off', self.out)
+        self.assertIn('No password needed', self.out)
+
+    def test_setup_no_changes_nothing_and_is_not_asked_again(self):
+        self.at_terminal([1])
+        self.assertEqual(self.lfg('setup'), 0, self.out)
+        self.assertIn('Nothing changed', self.out)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.asked, [])
+        self.assertFalse(os.path.exists(self.rule()))
+        self.assertEqual(self.read('state/setup-asked').split()[0], 'no')
+        self.assertEqual(self.lfg('2'), 0, self.out)  # the first start: no question again (FakeMenu has no picks)
+        self.assertEqual(len(self.fake.shown), 1)
+        self.assertEqual(len(self.asked), 1)  # the usual password
+        self.assertEqual(self.read('lock').strip(), 'off')  # the usual run
+
+    def test_first_start_asks_once_and_yes_means_one_password_in_all(self):
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(len(self.fake.shown), 1)
+        self.assertEqual(len(self.asked), 1)
+        self.assertIn("won't ask for your password again", self.out)
+        self.assertIn('On until', self.out)
+        self.assertEqual(lfg.status()['kind'], 'on')
+        self.assertEqual(self.solo(), 1)
+        self.assertEqual(self.read('lock').strip(), 'immediate')
+        self.assertEqual(self.lfg('off'), 0, self.out)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(len(self.fake.shown), 1)  # never asked again
+
+    def test_first_start_no_goes_on_the_usual_way(self):
+        self.at_terminal([1])
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertIn('keep asking for your password', self.out)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.read('lock').strip(), 'off')
+        self.assertEqual(self.loops(), (1, 1))
+        self.assertFalse(os.path.exists(self.rule()))
+
+    def test_first_start_question_is_never_shown_without_a_terminal(self):
+        self.fake = FakeMenu()
+        with mock.patch.object(lfg, 'Menu', self.fake):  # can_ask is the real one: output here is not a terminal
+            self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(self.fake.shown, [])
+        self.assertFalse(os.path.exists(self.d + '/state/setup-asked'))  # still to be asked, at a terminal
+
+    def test_first_start_question_waits_while_lfg_left_something_off(self):
+        self.at_terminal()
+        os.makedirs(self.d + '/state', exist_ok=True)
+        self.write('lock', 'off')
+        self.write('state/lock-before', 'immediate')
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(self.fake.shown, [])
+        self.assertFalse(os.path.exists(self.d + '/state/setup-asked'))
+
+    def test_setup_is_refused_while_a_run_is_on(self):
+        self.lfg('2')
+        mac = lambda: [c for c in self.calls() if not c.startswith('caffeinate')]  # the loop's own, any time
+        before = mac()
+        self.at_terminal()
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn('lfg is on right now', self.out)
+        self.assertEqual(mac(), before)
+        self.assertFalse(os.path.exists(self.rule()))
+
+    def test_setup_is_refused_while_lid_sleep_is_left_off(self):
+        self.write('sleepdisabled', '1')
+        self.at_terminal()
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn('Lid sleep is still off', self.out)
+        self.assertEqual(self.fake.shown, [])
+
+    def test_setup_without_a_terminal_says_so(self):
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn('run it in Terminal', self.out)
+        self.assertEqual(self.calls(), [])
+
+    def test_setup_on_a_mac_with_no_sudoers_folder_changes_nothing(self):
+        os.rmdir(self.d + '/sudoers.d')
+        self.at_terminal()
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn("can't take the rule", self.out)
+        self.assertEqual((self.asked, self.calls(), self.fake.shown), ([], [], []))
+
+    def test_setup_takes_nothing_else(self):
+        self.assertEqual(self.lfg('setup', 'now'), 2)
+
+    def test_already_set_up(self):
+        self.set_up_free()
+        self.assertEqual(self.lfg('setup'), 0)
+        self.assertIn('already never asks', self.out)
+        self.assertEqual(len(self.fake.shown), 1)
+
+    def no_rule_left(self):
+        self.assertEqual(os.listdir(self.d + '/sudoers.d'), [])
+        self.assertFalse(lfg.free_mode())
+
+    def test_visudo_refusing_the_rule_leaves_nothing(self):
+        self.write('visudo_fail', '1')
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn("visudo didn't accept it", self.out)
+        self.no_rule_left()
+        self.assertEqual([c for c in self.calls() if c.startswith(('visudo', 'sudo-n'))],
+                         ['visudo -c -q', 'visudo -c -q -f %s.new' % self.rule()])  # never moved in, never tried
+
+    def test_visudo_refusing_the_whole_setup_takes_the_rule_out(self):
+        self.write('visudo_full_fail', '1')
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn("didn't pass visudo's check", self.out)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+
+    def test_a_sudo_setup_already_broken_is_left_alone(self):
+        self.write('visudo_broken', '1')
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn('already fail', self.out)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+        self.assertEqual([c for c in self.calls() if c.startswith(('visudo', 'chown'))], ['visudo -c -q'])
+
+    def test_a_rule_sudo_ignores_is_taken_out_again(self):
+        self.write('no_includedir', '1')
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn("sudo doesn't use it, so it was taken out again", self.out)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+
+    def test_a_rule_lfg_could_never_see_is_taken_out_again(self):
+        """A Mac whose sudoers folder this account can't look into: lfg would add the rule and never know."""
+        real, rule = os.path.exists, self.rule()
+        self.at_terminal([0])
+        with mock.patch.object(lfg.os.path, 'exists', side_effect=lambda p: False if p == rule else real(p)):
+            self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn("can't see into", self.out)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+        self.assertFalse([c for c in self.calls() if c.startswith('sudo-n')])  # never tried, never kept
+
+    def test_a_rule_that_cannot_be_taken_out_again_says_so(self):
+        self.write('no_includedir', '1')
+        self.at_terminal([0])
+        real_run = lfg.run
+        def run(args, pw=None, **kw):  # root's rm fails
+            if 'lfg-unsetup' in args:
+                return subprocess.CompletedProcess(args, 1, '', 'rm: Operation not permitted')
+            return real_run(args, pw, **kw)
+        with mock.patch.object(lfg, 'run', side_effect=run):
+            self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn('it is still there', self.out)
+        self.assertIn('lfg setup --undo', self.out)
+        self.assertNotIn('nothing changed', self.out)
+
+    def test_yes_at_the_first_start_that_fails_starts_nothing_and_says_so(self):
+        self.write('visudo_fail', '1')
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('2'), 1)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.assertEqual(self.read('lock').strip(), 'immediate')
+        self.assertEqual(self.loops(), (0, 0))
+        self.assertIn('nothing changed', self.out)
+        self.assertIn("lfg isn't on. Type lfg again to start it the usual way.", self.out)
+        os.remove(self.d + '/visudo_fail')
+        self.assertEqual(self.lfg('2'), 0, self.out)  # and the next lfg is the usual run, no question
+        self.assertEqual(len(self.fake.shown), 1)
+        self.assertEqual(self.read('lock').strip(), 'off')
+
+    def test_yes_then_no_password_asks_again_next_time(self):
+        self.at_terminal([0, 1])
+        self.answers = ['nope', 'nope', 'nope']
+        self.assertEqual(self.lfg('2'), 1)
+        self.assertFalse(os.path.exists(self.d + '/state/setup-asked'))
+        self.assertEqual(self.lfg('2'), 0, self.out)  # asked again; No this time, then the usual run
+        self.assertEqual(len(self.fake.shown), 2)
+        self.assertEqual(self.read('state/setup-asked').split()[0], 'no')
+
+    def test_ctrl_c_at_the_password_after_yes_changes_nothing_and_asks_again(self):
+        self.at_terminal([0])
+        self.answers = [KeyboardInterrupt]
+        self.assertEqual(self.lfg('2'), 130)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+        self.assertFalse(os.path.exists(self.d + '/state/setup-asked'))
+
+    def test_esc_is_no_and_the_screen_says_so(self):
+        self.at_terminal([None])
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(self.read('state/setup-asked').split()[0], 'no')
+        self.assertIn('Esc is No', self.fake.shown[0][3])
+        self.assertEqual(self.read('lock').strip(), 'off')  # the usual run
+
+    def test_uninstall_waits_for_another_window(self):
+        """Another window has the setup question open: uninstall must not pull lfg out from under it."""
+        import fcntl
+        Shared.make_install(self)
+        with open(os.path.join(lfg.STATE, 'lock'), 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertIn('busy in another window', self.out)
+        self.assertTrue(os.path.exists(lfg.SHARE + '/lfg'))
+        self.assertTrue(os.path.islink(self.d + '/onpath/lfg'))
+
+    def test_three_wrong_passwords_at_setup_change_nothing(self):
+        self.at_terminal([0])
+        self.answers = ['nope', 'nope', 'nope']
+        self.assertEqual(self.lfg('setup'), 1)
+        self.no_rule_left()
+        self.assertFalse([c for c in self.calls() if not c.startswith('sudo-refused')])
+
+    def test_the_password_is_never_on_a_command_line_or_in_a_file(self):
+        self.at_terminal([0])
+        self.answers = ['nope', PW]
+        self.assertEqual(self.lfg('setup'), 0, self.out)
+        self.lfg('2')
+        self.lfg('off')
+        found = [p for p, _, fs in os.walk(self.d) for f in fs if f not in STUBS and PW in self.read(
+            os.path.relpath(os.path.join(p, f), self.d))]
+        self.assertEqual(found, [])
+        self.assertNotIn(PW, ' '.join(lfg.rule_lines()))
+
+    def test_undo_takes_the_rule_out_and_the_usual_way_comes_back(self):
+        self.set_up_free()
+        self.answers = [PW]
+        self.assertEqual(self.lfg('setup', '--undo'), 0, self.out)
+        self.assertIn('asks for your password again', self.out)
+        self.no_rule_left()
+        self.answers = [PW]
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(len(self.asked), 2)
+        self.assertEqual(self.read('lock').strip(), 'off')
+        self.assertEqual(self.loops(), (1, 1))
+        self.assertEqual(len(self.fake.shown), 1)  # and the question doesn't come back
+
+    def test_off_ends_its_loop_at_once_so_undo_can_follow_straight_after(self):
+        self.set_up_free()
+        with mock.patch.object(lfg, 'TICK', 30):  # the real Mac's pace: a loop looks only every so often
+            self.assertEqual(self.lfg('2'), 0, self.out)
+            t = time.time()
+            self.assertEqual(self.lfg('off'), 0, self.out)
+            self.assertEqual(self.solo(), 0)
+            self.assertTrue(self.wait(lambda: not self.awake_running(), 3))
+            self.answers = [PW]
+            self.assertEqual(self.lfg('setup', '--undo'), 0, self.out)
+            self.assertLess(time.time() - t, 10)
+        self.assertNotIn('finishing', self.out)
+        self.no_rule_left()
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+
+    def test_undo_is_refused_while_on(self):
+        self.set_up_free()
+        self.lfg('2')
+        self.assertEqual(self.lfg('setup', '--undo'), 1)
+        self.assertIn('lfg off first', self.out)
+        self.assertTrue(os.path.exists(self.rule()))
+
+    def test_undo_with_lid_sleep_left_off_puts_it_back(self):
+        self.set_up_free()
+        self.write('sleepdisabled', '1')
+        self.answers = [PW]
+        self.assertEqual(self.lfg('setup', '--undo'), 0, self.out)
+        self.no_rule_left()
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+
+    def test_undo_with_nothing_to_undo(self):
+        self.assertEqual(self.lfg('setup', '--undo'), 0)
+        self.assertIn('nothing to undo', self.out)
+        self.assertEqual(self.calls(), [])
+
+    def test_undo_without_a_terminal_changes_nothing(self):
+        self.set_up_free()
+        self.answers = [lfg.NoTerminal]
+        self.assertEqual(self.lfg('setup', '--undo'), 1)
+        self.assertIn('run lfg setup --undo in Terminal', self.out)
+        self.assertTrue(os.path.exists(self.rule()))
+
+    def make_install(self):
+        Shared.make_install(self)
+
+    def test_uninstall_takes_the_rule_out_first(self):
+        self.set_up_free()
+        self.make_install()
+        self.answers = [PW]
+        self.assertEqual(self.lfg('uninstall'), 0, self.out)
+        self.no_rule_left()
+        self.assertFalse(os.path.exists(lfg.SHARE))
+        self.assertFalse(os.path.lexists(self.d + '/onpath/lfg'))
+        self.assertFalse(os.path.exists(lfg.STATE))
+
+    def test_uninstall_without_a_terminal_removes_nothing(self):
+        self.set_up_free()
+        self.make_install()
+        self.answers = [lfg.NoTerminal]
+        self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertIn('run lfg uninstall in Terminal', self.out)
+        self.assertTrue(os.path.exists(self.rule()))
+        self.assertTrue(os.path.exists(lfg.SHARE + '/lfg'))
+        self.assertTrue(os.path.islink(self.d + '/onpath/lfg'))
+
+    def test_uninstall_with_a_wrong_password_removes_nothing(self):
+        self.set_up_free()
+        self.make_install()
+        self.answers = ['nope', 'nope', 'nope']
+        self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertTrue(os.path.exists(self.rule()))
+        self.assertTrue(os.path.exists(lfg.SHARE + '/lfg'))
+
+    def test_uninstall_is_refused_while_on(self):
+        self.set_up_free()
+        self.make_install()
+        self.lfg('2')
+        self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertIn('lfg off', self.out)
+        self.assertTrue(os.path.exists(self.rule()))
+
+    def test_a_rule_that_stopped_working_stops_the_start_cleanly(self):
+        self.set_up_free()
+        self.write('no_includedir', '1')
+        self.assertEqual(self.lfg('2'), 1)
+        self.assertIn("no-password rule didn't work", self.out)
+        self.assertNotIn('No password needed', self.out)
+        self.assertIn('lfg is off', self.out)
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.assertTrue(self.wait(lambda: self.solo() == 0, 5))
+        self.assertEqual(self.asked, [])
+
+    def test_off_when_the_rule_stopped_working_says_what_to_do(self):
+        self.set_up_free()
+        self.lfg('2')
+        self.write('no_includedir', '1')
+        self.assertEqual(self.lfg('off'), 1)
+        self.assertIn('lid sleep is still off', self.out)
+        self.assertIn('lfg setup --undo', self.out)
+        self.assertTrue(self.wait(lambda: self.solo() == 0, 5))
+        self.answers = [PW]
+        self.assertEqual(self.lfg('setup', '--undo'), 0, self.out)  # that puts it right
+        self.assertEqual(self.read('sleepdisabled').strip(), '0')
+        self.no_rule_left()
+
+    def test_a_name_sudo_would_misread_is_written_as_the_user_id(self):
+        for name, who in (('udayan', 'udayan'), ('first.last', 'first.last'), ('a b', '#%d' % os.getuid()),
+                          ('x,y', '#%d' % os.getuid()), ('9lives', '#%d' % os.getuid()), ('BOB', '#%d' % os.getuid()),
+                          ('Udayan', '#%d' % os.getuid())):
+            fake = pwd.struct_passwd((name, 'x', os.getuid(), 20, '', '/', '/bin/zsh'))
+            with mock.patch.object(lfg.pwd, 'getpwuid', return_value=fake):
+                comment, rule = lfg.rule_lines()
+            self.assertTrue(rule.startswith(who + ' ALL = (root) NOPASSWD: '), rule)
+            self.assertTrue(comment.startswith('# '))
+            self.assertNotIn('\n', comment + rule)
+
+    def test_the_question_fits_80_columns(self):
+        lines = lfg.question_frame(lfg.SETUP_TITLE, lfg.SETUP_NOTES, lfg.SETUP_ROWS, 0, lfg.SETUP_HINT)
+        for l in lines:
+            self.assertLess(len(''.join(t for t, _ in l)), 80, l)
+
+
+# lfg 1.0.0 as released (main before no-password mode): what everyone who doesn't opt in must keep getting.
+BASE = '4b4ff96'
+
+
+class SameAsBefore(unittest.TestCase):
+    """Runs the released 1.0.0 and this lfg through the same steps, each in its own sandbox with the same
+    stand-ins, and compares everything they did: exit codes, words on screen, password prompts, every Mac command
+    in order, the loops' command lines and the files left behind. For someone who hasn't opted in (no terminal,
+    or a terminal and 'No' already answered), the two must match exactly."""
+
+    @classmethod
+    def setUpClass(cls):
+        here = os.path.dirname(os.path.abspath(__file__))
+        r = subprocess.run(['git', '-C', here, 'show', BASE + ':lfg'], capture_output=True, text=True)
+        if r.returncode:
+            raise unittest.SkipTest('no git history here to compare with lfg 1.0.0')
+        cls.tmp = tempfile.mkdtemp(prefix='lfgbase-')
+        with open(cls.tmp + '/lfg_base', 'w') as f:
+            f.write(r.stdout)
+        cls.base = load('lfg_base', cls.tmp + '/lfg_base')
+        assert cls.base.VERSION == '1.0.0'
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def transcript(self, mod, steps, tty=False, answered=None):
+        d = os.path.realpath(tempfile.mkdtemp(prefix='lfgtwin-'))
+        os.makedirs(d + '/bin')
+        os.makedirs(d + '/sudoers.d')
+        for name, body in STUBS.items():
+            with open('%s/bin/%s' % (d, name), 'w') as f:
+                f.write(body)
+            os.chmod('%s/bin/%s' % (d, name), 0o755)
+        b, state = d + '/bin/', d + '/state'
+        values = dict(SUDO=b + 'sudo', PMSET=b + 'pmset', SYSADMINCTL=b + 'sysadminctl', CAFFEINATE=b + 'caffeinate',
+                      OSASCRIPT=b + 'osascript', PS=b + 'ps', ID=b + 'id', CURL=b + 'curl', VISUDO=b + 'visudo',
+                      CHOWN=b + 'chown', SUDOERS_D=d + '/sudoers.d', ROOT=ME, TICK=1, STATE=state,
+                      DEADLINE=state + '/until', LOG=state + '/log', STARTED=state + '/started',
+                      LOCK_BEFORE=state + '/lock-before', ASKED=state + '/setup-asked', SHARE=d + '/share',
+                      HOME=d + '/home')
+        values = {k: v for k, v in values.items() if hasattr(mod, k)}  # 1.0.0 has no setup paths
+        answers, asked = [], []
+
+        def fake_ask(prompt):
+            asked.append(prompt)
+            a = answers.pop(0) if answers else PW
+            if a == 'NO_TERMINAL':
+                raise mod.NoTerminal
+            if isinstance(a, type) and issubclass(a, BaseException):
+                raise a
+            return a
+
+        patches = [mock.patch.multiple(mod, **values), mock.patch.dict(os.environ, {'LFG_TEST_DIR': d, 'NO_COLOR': '1'}),
+                   mock.patch.object(mod, 'ask', side_effect=fake_ask),
+                   mock.patch.object(mod, 'Menu', side_effect=OSError('no terminal in tests'))]
+        if hasattr(mod, 'can_ask'):
+            patches.append(mock.patch.object(mod, 'can_ask', return_value=tty))
+        for p in patches:
+            p.start()
+        try:
+            for name in SANDBOXED:
+                if hasattr(mod, name) and not getattr(mod, name).startswith(d + '/'):
+                    raise SystemExit('refusing to run: %s is not the sandbox stand-in' % name)
+            os.makedirs(state)
+            if answered:
+                with open(state + '/setup-asked', 'w') as f:
+                    f.write(answered)
+            for name, text in (('sleepdisabled', '0'), ('lock', 'immediate')):
+                with open('%s/%s' % (d, name), 'w') as f:
+                    f.write(text)
+            return self.play(mod, d, steps, answers, asked)
+        finally:
+            table = subprocess.run(['/bin/ps', '-axww', '-o', 'pid=,command='], capture_output=True, text=True).stdout
+            for line in table.splitlines():
+                pid, _, cmd = line.strip().partition(' ')
+                if d + '/' in cmd and int(pid) != os.getpid():
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                    except OSError:
+                        pass
+            for p in reversed(patches):
+                p.stop()
+            shutil.rmtree(d, ignore_errors=True)
+
+    # Commands lfg itself runs, in order. The loops' own (lid sleep back on at the end, the relock window,
+    # caffeinate) run on their own clock: they are compared as a whole at the end instead.
+    MAIN = ('sudo', 'sysadminctl', 'visudo', 'chown', 'curl')
+
+    def play(self, mod, d, steps, answers, asked):
+        def norm(text):
+            text = text.replace(d, '<D>')
+            text = re.sub(r'\b\d{10}\b', '<T>', text)
+            text = re.sub(r'\b\d{1,2}:\d\d( tomorrow| [A-Z][a-z]{2})?', '<clock>', text)
+            text = re.sub(r'\b\d+h \d\dm\b|\b\d+m\b', '<span>', text)
+            text = re.sub(r'-w \d+', '-w <pid>', text)
+            return re.sub(r'\d+% done', '<n>% done', text)
+
+        def read(name):
+            try:
+                with open('%s/%s' % (d, name)) as f:
+                    return f.read().strip()
+            except OSError:
+                return '-'
+
+        def calls():
+            text = read('calls.log')
+            return [] if text == '-' else text.splitlines()
+
+        def settle(secs=30):
+            """Loops of a run that is over are let finish, so what is left over doesn't depend on timing."""
+            stop = time.time() + secs
+            while time.time() < stop:
+                s = mod.status()
+                if s['kind'] == 'on' or not (s['admin'] or s['awake']):
+                    break
+                time.sleep(0.2)
+            time.sleep(0.3)
+
+        out, seen = [], 0
+        for step in steps:
+            kind, arg = step[0], step[1:]
+            if kind == 'write':
+                with open('%s/%s' % (d, arg[0]), 'w') as f:
+                    f.write(arg[1])
+                continue
+            if kind == 'answers':
+                answers[:] = list(arg[0])
+                continue
+            if kind == 'install':  # what Shared.make_install sets up, for uninstall
+                os.makedirs(mod.SHARE)
+                open(mod.SHARE + '/lfg', 'w').close()
+                os.makedirs(d + '/onpath')
+                os.symlink(mod.SHARE + '/lfg', d + '/onpath/lfg')
+                os.environ['PATH'] = d + '/onpath:' + os.environ.get('PATH', '')
+                continue
+            if kind == 'wait-end':
+                stop = time.time() + 30
+                while time.time() < stop and mod.status()['kind'] == 'on':
+                    time.sleep(0.2)
+                settle()
+                continue
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                if kind == 'pick':
+                    with mock.patch.object(mod, 'pick', side_effect=lambda s: mod.choices(s)[arg[0]]):
+                        rc = mod.main([])
+                else:
+                    rc = mod.main(list(arg))
+            settle()
+            now = calls()
+            new, seen = now[seen:], len(now)
+            s = mod.status()
+            until = read('state/until')
+            left = round((int(until) - time.time()) / 60) if until.isdigit() and int(until) > 0 else until
+            out.append(dict(
+                step=' '.join(map(str, step)), rc=rc, said=norm(buf.getvalue()).splitlines(),
+                prompts=list(asked), mac=[norm(c) for c in new if c.startswith(self.MAIN)],
+                loops=sorted(norm(p['cmd']) for p in s['admin'] + s['awake']), kind=s['kind'],
+                files=dict(sleepdisabled=read('sleepdisabled'), lock=read('lock'), before=read('state/lock-before'),
+                           until_minutes_left=left, share=os.path.exists(d + '/share'),
+                           onpath=os.path.lexists(d + '/onpath/lfg'), sudoers=os.listdir(d + '/sudoers.d'))))
+            asked.clear()
+        everything = [norm(c) for c in calls()]
+        return out + [dict(all_mac=sorted(c for c in everything if not c.startswith('caffeinate')),
+                           caffeinate=sorted({c for c in everything if c.startswith('caffeinate')}))]
+
+    def same(self, steps):
+        want = self.transcript(self.base, steps)
+        for tty, answered in ((False, None), (True, 'no 2026-11-28')):
+            got = self.transcript(lfg, steps, tty=tty, answered=answered)
+            for a, b in zip(want, got):
+                self.assertEqual(a, b, 'differs from lfg 1.0.0 (terminal=%s, answered=%s)' % (tty, answered))
+            self.assertEqual(len(want), len(got))
+
+    def test_start_extend_list_status_off_uninstall(self):
+        self.same([('lfg', '2'), ('lfg', '+1'), ('lfg', 'status'), ('lfg', '1'), ('pick', 0), ('pick', 4),
+                   ('lfg', '3'), ('lfg', 'off'), ('lfg', 'status'), ('lfg', 'off'), ('lfg', '+2'),
+                   ('install',), ('lfg', 'uninstall')])
+
+    def test_turn_off_from_the_list(self):
+        self.same([('lfg',), ('pick', 3), ('lfg', 'status')])
+
+    def test_a_natural_end_and_the_relock_window(self):
+        self.same([('write', 'lock', '300'), ('lfg', '0.0015'), ('wait-end',), ('lfg', 'status'),
+                   ('lfg', 'off')])
+
+    def test_passwords_no_terminal_and_ctrl_c(self):
+        self.same([('answers', ['nope', 'nope', 'nope']), ('lfg', '2'),
+                   ('answers', ['nope', PW]), ('lfg', '2'), ('lfg', 'off'),
+                   ('answers', ['NO_TERMINAL']), ('lfg', '2'),
+                   ('answers', [KeyboardInterrupt]), ('lfg', '2'), ('lfg', 'status')])
+
+    def test_standard_account_stuck_sleep_and_a_left_off_lock(self):
+        self.same([('write', 'groups', 'staff everyone localaccounts'), ('answers', ['whatever']), ('lfg', '2'),
+                   ('write', 'groups', 'staff everyone admin'),
+                   ('write', 'sleepdisabled', '1'), ('lfg', 'status'), ('lfg', '1'), ('lfg', 'off'),
+                   ('write', 'lock', 'off'), ('write', 'state/lock-before', '300'), ('lfg', 'status'),
+                   ('install',), ('lfg', 'uninstall'), ('lfg', 'off'), ('lfg', 'status')])
 
 
 class Pieces(unittest.TestCase):
