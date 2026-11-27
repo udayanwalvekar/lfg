@@ -5,7 +5,7 @@
 # What it does: puts lfg on this Mac (the program goes in ~/.local/share/lfg, the command in a folder already on
 # your PATH). lfg keeps the Mac awake with the lid shut for a few hours, then puts sleep and the screen lock back.
 # Nothing is downloaded: the program is inside this file. Installing changes no Mac settings; lfg itself does,
-# only when you run it and type your password.
+# only when you run it and type your password (or, after you say yes to `lfg setup`, with no password).
 # Remove it all again with:   lfg uninstall
 set -euo pipefail
 
@@ -48,6 +48,8 @@ hours, then put sleep and the screen lock back.
   lfg +2         add 2 hours to the current end
   lfg 0 | off    off now: sleep and the screen lock come back
   lfg status     say whether it is on; changes nothing
+  lfg setup      never ask for the password again (asks it one last time;
+                 lfg setup --undo asks again)
   lfg update     get the newest lfg
   lfg uninstall  remove lfg from this Mac
 
@@ -58,11 +60,17 @@ How it works: one time on disk (~/.lfg/until) says when it ends. Two small backg
 20 seconds: one (run as admin) turns lid sleep back on when the time has passed, the other keeps the Mac
 awake until then and, at the end, opens a Terminal window asking for the password to turn the screen lock
 back on. Extending = writing a later time; nothing is restarted.
+
+No-password mode (opt in with `lfg setup`): the password is typed one last time to add one rule,
+/etc/sudoers.d/lfg-<your user id>, that lets this account run exactly `pmset -a disablesleep 1` and
+`pmset -a disablesleep 0` as admin with no password. Then start, stop and extend never ask, and lfg never
+touches the screen lock. One loop, run as you, keeps the Mac awake (the display can still sleep and lock)
+and turns lid sleep back on at the end through that rule. `lfg setup --undo` and `lfg uninstall` take it out.
 https://github.com/udayanwalvekar/lfg
 """
 import datetime, fcntl, getpass, os, pwd, re, select, shutil, signal, stat, subprocess, sys, tempfile, termios, time, tty
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 REPO = 'udayanwalvekar/lfg'
 LATEST = 'https://raw.githubusercontent.com/%s/main/lfg.sh' % REPO
 
@@ -73,9 +81,11 @@ DEADLINE = os.path.join(STATE, 'until')
 STARTED = os.path.join(STATE, 'started')  # when the current run began (kept across extends)
 LOCK_BEFORE = os.path.join(STATE, 'lock-before')  # the screen lock as it was before lfg: immediate, seconds, off
 LOG = os.path.join(STATE, 'log')
+ASKED = os.path.join(STATE, 'setup-asked')  # the first-run question was answered (yes or no): never asked again
 SUDO, PMSET, SYSADMINCTL, ID = '/usr/bin/sudo', '/usr/bin/pmset', '/usr/sbin/sysadminctl', '/usr/bin/id'
 CAFFEINATE, OSASCRIPT, PS, SH = '/usr/bin/caffeinate', '/usr/bin/osascript', '/bin/ps', '/bin/sh'
 CURL, NOTHING = '/usr/bin/curl', '/usr/bin/true'
+SUDOERS_D, VISUDO, CHOWN = '/etc/sudoers.d', '/usr/sbin/visudo', '/usr/sbin/chown'  # only for `lfg setup`
 ROOT = 'root'  # the user the admin loop runs as
 TICK = 20  # seconds between the loops' looks at the end time
 DEFAULT_HOURS = 3
@@ -102,6 +112,30 @@ USER_LOOP = ('f=$1; tick=$2; good=$3; caff=$4; cap=$5; osa=$6; c=; '
              '/bin/sleep "$tick"; done; '
              '[ -n "$c" ] && kill "$c" 2>/dev/null; '
              '[ "$e" -ne 0 ] && "$osa" -e "$7" -e "$8"')
+# No-password mode: ONE loop, as him. It keeps the Mac awake without keeping the display on (no -d, no -u), so
+# the screen still dims and locks as he has it set, and at the end it turns lid sleep back on through the rule
+# `lfg setup` added. Args: $1-$5 as above, $6 sudo, $7 pmset, $8 the log (a failed end is written there).
+SOLO_LOOP = ('f=$1; tick=$2; good=$3; caff=$4; cap=$5; sudo=$6; pmset=$7; log=$8; c=; '
+             'while :; do ' + _READ +
+             'if [ -z "$c" ] || ! kill -0 "$c" 2>/dev/null; then "$caff" -ims -t 259200 -w $$ & c=$!; fi; '
+             '/bin/sleep "$tick"; done; '
+             '[ -n "$c" ] && kill "$c" 2>/dev/null; '
+             '"$sudo" -n "$pmset" -a disablesleep 0 </dev/null >/dev/null 2>&1 || '
+             '/bin/echo "$(/bin/date "+%Y-%m-%d %H:%M:%S")  end: lid sleep NOT back on, the rule said no" >> "$log"')
+# As admin, once, at `lfg setup`: write the rule under a name sudo never reads (it skips names with a dot), make
+# it root's and read-only, have visudo check it, and only then move it into place; then visudo checks the whole
+# sudo setup with it, and takes it out again if that fails. Nothing reads stdin (the password is in it).
+# Args: $1 the rule's path, $2 $3 its two lines, $4 visudo, $5 chown. Exit 3 = visudo refused the rule,
+# 4 = visudo refused the whole setup with it in (taken out again), 5 = it could not be written.
+ADD_RULE = ('exec </dev/null; umask 077; r=$1; t="$1.new"; /bin/rm -f "$t" || exit 5; '
+            '/usr/bin/printf "%s\\n%s\\n" "$2" "$3" > "$t" || { /bin/rm -f "$t"; exit 5; }; '
+            '{ "$5" 0:0 "$t" && /bin/chmod 0440 "$t"; } || { /bin/rm -f "$t"; exit 5; }; '
+            '"$4" -c -q -f "$t" >/dev/null 2>&1 || { /bin/rm -f "$t"; exit 3; }; '
+            '/bin/mv -f "$t" "$r" || { /bin/rm -f "$t"; exit 5; }; '
+            '"$4" -c -q >/dev/null 2>&1 || { /bin/rm -f "$r"; exit 4; }')
+DEL_RULE = 'exec </dev/null; /bin/rm -f "$1" "$1.new" && [ ! -e "$1" ]'
+
+
 def relock(value):
     """The Terminal window's script at a natural end: the screen lock back to `value` (immediate or seconds,
     already checked to be one of those)."""
@@ -309,22 +343,39 @@ def remember_lock(now):
     write_text(LOCK_BEFORE, now)
 
 
+def rule_path():
+    """Where `lfg setup` puts the no-password rule: one file per account, named by its user id. No dot in the
+    name: sudo skips files in sudoers.d whose names have one (so the half-made lfg-501.new is never read)."""
+    return os.path.join(SUDOERS_D, 'lfg-%d' % os.getuid())
+
+
+def free_mode():
+    """No-password mode is on when the rule is there. Only an admin can put a file in that folder."""
+    return os.path.exists(rule_path())
+
+
 def status():
     """Everything lfg needs to know, read from the Mac itself (live processes + the lid-sleep setting)."""
     now, me = time.time(), pwd.getpwuid(os.getuid()).pw_name
     procs = processes()
+    free = free_mode()
     mine = lambda p, name: p['cmd'].startswith(SH + ' -c ') and (' %s %s ' % (name, DEADLINE)) in p['cmd']
     s = dict(now=now, admin=[p for p in procs if p['user'] == ROOT and mine(p, 'lfg-root')],
              awake=[p for p in procs if p['user'] == me and mine(p, 'lfg-user')],
-             sleep_off=sleep_disabled(), lock=lock_setting(), lock_was=read_lock_before(), end=read_end())
+             sleep_off=sleep_disabled(),
+             # No-password mode never touches the screen lock, so it doesn't even read it.
+             lock=None if free else lock_setting(), lock_was=None if free else read_lock_before(), end=read_end())
+    s['free'] = free
+    s['solo'] = [p for p in procs if p['user'] == me and mine(p, 'lfg-solo')]  # no-password mode's one loop
     s['lock_off'] = s['lock'] == 'off'
     # Off because of lfg (it was on before a run), not because that is how he keeps it.
     s['lock_left_off'] = s['lock_off'] and s['lock_was'] not in (None, 'off')
     s['started'] = None
-    if s['admin'] and s['end'] and s['end'] > now:
+    keepers = s['admin'] + s['solo']  # whatever will turn lid sleep back on at the end
+    if keepers and s['end'] and s['end'] > now:
         s['kind'], s['until'] = 'on', s['end']
         first = read_time(STARTED)
-        loop = now - max(p['age'] for p in s['admin'])
+        loop = now - max(p['age'] for p in keepers)
         s['started'] = first if first and first <= now else loop
     elif s['sleep_off']:
         s['kind'], s['until'] = 'stuck', None
@@ -347,6 +398,8 @@ def describe(s, out=None):
         say('·', 'lfg is off', 'lfg = 3 hours, lfg 6 = 6 hours', style='2', out=out)
     if s['kind'] in ('off', 'stuck') and s['lock_left_off']:
         say('!', 'The screen lock is still off', 'lfg off turns it back on', style=colour(AMBER), out=out)
+    if s['free']:
+        aside('No password needed to start, stop or extend it.', out)
 
 
 # ---- the password, once ----------------------------------------------------------------------------------
@@ -481,13 +534,68 @@ def turn_off(pw):
     return status()
 
 
+# ---- no-password mode (after `lfg setup`) ----------------------------------------------------------------
+def no_password(*args):
+    """Run pmset as admin through the rule: sudo -n never asks, it only says yes or no."""
+    return run([SUDO, '-n', PMSET] + list(args), stdin=subprocess.DEVNULL)
+
+
+def start_free(end):
+    """The same run with no password and no screen lock. The loop that turns lid sleep back on comes first, then
+    lid sleep goes off through the rule. Returns the status afterwards ('refused' set if the rule said no)."""
+    s = status()
+    if (s['admin'] or s['awake'] or s['solo']) and s['kind'] != 'on':
+        s = wait_for(lambda x: not x['admin'] and not x['awake'] and not x['solo'], TICK + 10)  # as in start()
+    write_end(end)
+    log('end set to %s (no password)' % clock(end))
+    write_time(STARTED, int(s['started'] if s['kind'] == 'on' and s['started'] else time.time()))
+    if not s['solo'] and not s['admin']:
+        subprocess.Popen([SH, '-c', SOLO_LOOP, 'lfg-solo', DEADLINE, str(TICK), str(end), CAFFEINATE,
+                          str(MAX_HOURS * 3600), SUDO, PMSET, LOG],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        if not wait_for(lambda x: x['solo'])['solo']:
+            log('keep-awake loop did not start: nothing else changed')
+            return status()
+    r = no_password('-a', 'disablesleep', '1')
+    log('lid sleep off (no password): exit %d' % r.returncode)
+    if r.returncode:
+        write_end(0)  # lid sleep was never turned off: nothing for the loop to put back
+        log('the no-password rule said no: run stopped')
+        new = end_solo()
+        new['refused'] = True
+        return new
+    new = wait_for(lambda x: (x['solo'] or x['admin']) and x['sleep_off'])
+    log('loops: keep-awake %s, lid sleep off %s' % (bool(new['solo'] or new['admin']), new['sleep_off']))
+    return new
+
+
+def end_solo():
+    """Stop no-password mode's loop now instead of at its next look (up to 20 s away), so lfg setup --undo or
+    lfg uninstall can follow straight after. Found afresh by its command line, so a reused number is never hit."""
+    for p in status()['solo']:
+        try:
+            os.kill(p['pid'], signal.SIGTERM)  # its caffeinate ends with it (-w)
+        except OSError:
+            pass
+    return wait_for(lambda x: not x['solo'], 3)
+
+
+def turn_off_free():
+    write_end(0)  # the loop sees 0 at its next look and ends
+    r = no_password('-a', 'disablesleep', '0')
+    log('off (no password): lid sleep back on, exit %d' % r.returncode)
+    return end_solo() if r.returncode == 0 else status()
+
+
 # ---- the choice when it is already on ----------------------------------------------------------------
 def choices(s):
     base = s['until']
     return [('add', 3, 'Add 3 hours', 'until ' + clock(base + 3 * 3600, s['now'])),
             ('add', 6, 'Add 6 hours', 'until ' + clock(base + 6 * 3600, s['now'])),
             ('custom', None, 'Custom…', 'type how many hours to add'),
-            ('off', 0, 'Turn it off now', 'sleep and screen lock come back · asks your password'),
+            ('off', 0, 'Turn it off now', 'the Mac can sleep again · no password' if s.get('free') else
+             'sleep and screen lock come back · asks your password'),
             ('leave', 0, 'Leave it as it is', '')]
 
 
@@ -565,6 +673,20 @@ def frame(s, rows, at, cols, typing=None):
         '  ↑ ↓ move  ·  Enter choose  ·  or press its number  ·  Esc leave it'
     out += [[], [(hint, '2')]]
     return out
+
+
+def question_frame(title, notes, rows, at, hint):
+    """One question on its own screen, Claude Code's way: the question in bold, plain notes under it, numbered
+    choices, the keys right under them."""
+    teal = colour(TEAL)
+    out = [[], [('  ✦  ', teal + ';1'), (title, '1')]]
+    out += [[('     ' + n, '2')] if n else [] for n in notes]
+    out.append([])
+    for i, (label, note) in enumerate(rows):
+        on = i == at
+        out.append([('  ❯ ' if on else '    ', teal + ';1'), ('%d  ' % (i + 1), teal if on else '2'),
+                    ('%-24s' % label, '1' if on else ''), (note, '2')])
+    return out + [[], [(hint, '2')]]
 
 
 def paint(pieces, cols):
@@ -645,6 +767,18 @@ class Menu:
             elif act:
                 return rows[at] if act == 'go' else None
 
+    def question(self, title, notes, rows, hint):
+        """-> the row picked (0, 1, …), or None for Esc."""
+        termios.tcflush(self.fd, termios.TCIFLUSH)  # keys typed before the question showed are dropped
+        at = 0
+        while True:
+            cols = os.get_terminal_size(self.fd).columns
+            lines = question_frame(title, notes, rows, at, hint)
+            os.write(self.fd, ('\x1b[H\x1b[J' + '\r\n'.join(paint(l, cols) for l in lines)).encode())
+            at, act = press(len(rows), at, self.key())
+            if act:
+                return at if act == 'go' else None
+
 
 def pick(s):
     try:
@@ -655,6 +789,193 @@ def pick(s):
         return menu.choose(s, choices(s))
     finally:
         menu.close()
+
+
+# ---- lfg setup: the password one last time, then never --------------------------------------------------
+SETUP_TITLE = 'Never ask for your password again?'
+SETUP_NOTES = ['Type it one last time and lfg adds one rule to this Mac.',
+               '',
+               'The rule lets your account turn lid sleep off and on with no password.',
+               "That's all it allows. Any program on this Mac could then keep it awake.",
+               'Nothing more.',
+               '',
+               'lfg also stops turning off your screen lock. The Mac keeps working with',
+               'the lid shut, and locks like it normally does.']
+SETUP_ROWS = [('Yes, never ask again', 'asks your password one last time'),
+              ('No, keep asking', 'lfg works like it does now')]
+SETUP_HINT = '  ↑ ↓ move  ·  Enter choose  ·  or press its number  ·  Esc not now'
+
+
+def can_ask():
+    """Someone is at a terminal to answer: lfg's own output goes to one, and the terminal opens."""
+    try:
+        if not sys.stdout.isatty():
+            return False
+        os.close(os.open('/dev/tty', os.O_RDWR))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def setup_question():
+    """The one question, on its own screen. -> True (yes), False (no or Esc). Raises NoTerminal."""
+    try:
+        menu = Menu()
+    except (OSError, termios.error):
+        raise NoTerminal
+    try:
+        at = menu.question(SETUP_TITLE, SETUP_NOTES, SETUP_ROWS, SETUP_HINT)
+    finally:
+        menu.close()
+    write_text(ASKED, '%s %s' % ('yes' if at == 0 else 'no', time.strftime('%Y-%m-%d')))
+    return at == 0
+
+
+def rule_lines():
+    """The rule's two lines: what it is, and the rule. The account by name when sudo reads names like it
+    plainly, else by user id (#501), which needs no escaping."""
+    name = pwd.getpwuid(os.getuid()).pw_name
+    who = name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name) else '#%d' % os.getuid()
+    return ('# lfg (github.com/%s) lets %s turn lid sleep off and on with no password. '
+            'Nothing else. Take it out with: lfg setup --undo' % (REPO, who),
+            '%s ALL = (root) NOPASSWD: %s -a disablesleep 1, %s -a disablesleep 0' % (who, PMSET, PMSET))
+
+
+def add_rule(pw):
+    """Put the rule in. -> '' when it is in and works, else why not (and then it is not there). It goes in only
+    if visudo passes it, and stays only if sudo then really runs lfg's command without a password."""
+    path = rule_path()
+    first, second = rule_lines()
+    r = run([SUDO, '-S', '-p', '', SH, '-c', ADD_RULE, 'lfg-setup', path, first, second, VISUDO, CHOWN], pw)
+    log('setup: add the rule: exit %d' % r.returncode)
+    if r.returncode == 3:
+        return "visudo didn't accept it."
+    if r.returncode == 4:
+        return "With it in, this Mac's sudo settings didn't pass visudo's check."
+    if r.returncode or not os.path.exists(path):
+        return "It couldn't be written."
+    run([SUDO, '-k'], stdin=subprocess.DEVNULL)  # forget the password sudo just took, so the try below can only pass through the rule
+    t = no_password('-a', 'disablesleep', '0')  # lfg's own command; lid sleep is already on, so it changes nothing
+    log('setup: the rule, tried with no password: exit %d' % t.returncode)
+    if t.returncode == 0:
+        return ''
+    r = run([SUDO, '-S', '-p', '', SH, '-c', DEL_RULE, 'lfg-unsetup', path], pw)
+    log('setup: it did not work, taken out: exit %d' % r.returncode)
+    if os.path.exists(path):
+        return "This Mac's sudo doesn't read it. Take it out with lfg setup --undo."
+    return "This Mac's sudo doesn't read it, so it was taken out again."
+
+
+def make_free():
+    """Yes to the question: the password one last time, the rule in, tried. -> True if it is on."""
+    pw = password('Type your Mac password one last time', 'lfg adds the rule with it. The password is not kept.')
+    if pw is None:
+        return False
+    with Busy():
+        why = add_rule(pw)
+    del pw
+    if why:
+        say('!', "Couldn't add the rule", 'it is still there' if os.path.exists(rule_path()) else 'nothing changed',
+            style=colour(AMBER))
+        aside(why)
+        return False
+    try:
+        os.remove(LOCK_BEFORE)  # the screen lock is no longer lfg's business
+    except OSError:
+        pass
+    say('✓', "Done · lfg won't ask for your password again")
+    aside('The rule allows only pmset -a disablesleep 1 and 0, as admin.')
+    aside("It's in %s. lfg setup --undo takes it out." % rule_path())
+    return True
+
+
+def busy_now(s):
+    """Why the password mode can't change right now, or ''. Loops whose end has passed are let finish first."""
+    if s['kind'] != 'on' and (s['admin'] or s['awake'] or s['solo']):
+        say('·', 'The last run is finishing', 'a few seconds', style='2')
+        s.update(wait_for(lambda x: not x['admin'] and not x['awake'] and not x['solo'], TICK + 10))
+    if s['kind'] == 'on' or s['admin'] or s['awake'] or s['solo']:
+        return 'lfg is on right now'
+    if s['kind'] == 'stuck':
+        return 'Lid sleep is still off'
+    if s['lock_left_off']:
+        return 'The screen lock is still off from a run'
+    return ''
+
+
+def first_run(s):
+    """At the first start typed in a terminal: the question, once. -> 'free' (the rule is in: start with no
+    password), 'stop' (yes, but it didn't work: say so and stop) or 'usual' (no, or not asked)."""
+    if s['free'] or os.path.lexists(ASKED) or not os.path.isdir(SUDOERS_D) or not can_ask() or busy_now(s):
+        return 'usual'
+    if not setup_question():
+        say('·', 'lfg will keep asking for your password', 'lfg setup changes that', style='2')
+        return 'usual'
+    return 'free' if make_free() else 'stop'
+
+
+def setup(args):
+    """`lfg setup` asks the question; `lfg setup --undo` takes the rule out."""
+    if args and args[0] in ('--undo', 'undo', '-u'):
+        return unsetup()
+    if args:
+        say('!', 'lfg setup takes nothing, or --undo', 'e.g. lfg setup', style=colour(AMBER))
+        return 2
+    s = status()
+    if s['free']:
+        say('✓', "lfg already never asks for your password", 'lfg setup --undo asks again')
+        return 0
+    problem = busy_now(s)
+    if problem:
+        say('!', problem, 'lfg off, then lfg setup', style=colour(AMBER))
+        return 1
+    if not os.path.isdir(SUDOERS_D):
+        say('!', "This Mac can't take the rule", 'it has no %s · nothing changed' % SUDOERS_D, style=colour(AMBER))
+        return 1
+    if not can_ask():
+        say('!', 'lfg setup needs you at the Mac', 'run it in Terminal', style=colour(AMBER))
+        return 1
+    if not setup_question():
+        say('·', 'Nothing changed', 'lfg keeps asking for your password', style='2')
+        return 0
+    return 0 if make_free() else 1
+
+
+def drop_rule(pw):
+    """Take the rule out. -> True if it is gone."""
+    r = run([SUDO, '-S', '-p', '', SH, '-c', DEL_RULE, 'lfg-unsetup', rule_path()], pw)
+    log('rule taken out: exit %d' % r.returncode)
+    return not os.path.exists(rule_path())
+
+
+def unsetup():
+    s = status()
+    if not s['free']:
+        say('·', 'lfg already asks for your password', 'nothing to undo', style='2')
+        return 0
+    if busy_now(s) == 'lfg is on right now':  # its loop needs the rule to turn lid sleep back on
+        say('!', 'lfg is on right now', 'lfg off first, then lfg setup --undo', style=colour(AMBER))
+        return 1
+    stuck = s['sleep_off']
+    pw = password('Take out the no-password rule · lfg will ask for your password again',
+                  'Lid sleep is still off; this turns it back on too.' if stuck else '')
+    if pw is None:
+        return 1
+    with Busy():
+        gone = drop_rule(pw)
+        if stuck:
+            r = run([SUDO, '-S', '-p', '', PMSET, '-a', 'disablesleep', '0'], pw)
+            log('lid sleep back on: exit %d' % r.returncode)
+    del pw
+    if not gone:
+        say('!', "Couldn't take the rule out", 'see ~/.lfg/log', style=colour(AMBER))
+        return 1
+    say('✓', 'Done · lfg asks for your password again')
+    aside('And it turns the screen lock off while it runs, as before.')
+    if stuck and sleep_disabled():
+        say('!', 'Lid sleep is still off', 'lfg off puts it back', style=colour(AMBER))
+        return 1
+    return 0
 
 
 # ---- main ------------------------------------------------------------------------------------------------
@@ -671,7 +992,7 @@ def parse(args):
         return 'help', None
     if a in ('version', '--version', '-v'):
         return 'version', None
-    if a in ('update', 'uninstall', 'installed'):
+    if a in ('update', 'uninstall', 'installed', 'setup'):
         return a, None
     add = a.startswith('+')
     try:
@@ -686,7 +1007,9 @@ def parse(args):
 def finish_on(s, verb):
     say('✓', '%s until %s' % (verb, clock(s['until'], s['now'])), span(s['until'] - s['now']) + ' left')
     aside('Lid shut is fine. Run lfg again to extend or turn it off.')
-    if not s['lock_off']:
+    if s['free']:
+        aside('Your screen lock is left as you have it.')
+    elif not s['lock_off']:
         say('!', 'The screen lock is still on', 'the Mac will lock when idle', style=colour(AMBER))
 
 
@@ -696,6 +1019,8 @@ def report(new, verb, failed):
         finish_on(new, verb)
         return 0
     say('!', failed, style=colour(AMBER))
+    if new.get('refused'):
+        aside("The no-password rule didn't work: run lfg setup --undo, then lfg setup.")
     describe(new)
     aside('What happened is in ~/.lfg/log')
     return 1
@@ -739,9 +1064,12 @@ def main(args=None):
     if what in ('update', 'uninstall', 'installed'):
         return {'update': update, 'uninstall': uninstall, 'installed': installed}[what](args[1:])
     try:
+        if what == 'setup':
+            return locked(lambda: setup(args[1:]))
         return locked(lambda: act(what, hours, status()))
     except NoTerminal:
-        say('!', 'This needs your Mac password', 'run lfg in Terminal', style=colour(AMBER))
+        say('!', 'This needs your Mac password', 'run %s in Terminal' % (
+            'lfg ' + ' '.join(args[:2]) if what == 'setup' else 'lfg'), style=colour(AMBER))
         return 1
     except KeyboardInterrupt:  # only possible at the password or the list: changes are made with Ctrl-C held
         print()
@@ -805,11 +1133,35 @@ def uninstall(args):
     """`lfg uninstall`: remove the program, its command and ~/.lfg. Refused while a run is on, so nothing is
     left with lid sleep off and no one to turn it back on."""
     s = status()
-    if s['kind'] in ('on', 'stuck') or s['admin'] or s['awake'] or s['lock_left_off']:
-        why = 'lfg is on right now' if s['kind'] == 'on' or s['admin'] or s['awake'] else \
+    if s['kind'] in ('on', 'stuck') or s['admin'] or s['awake'] or s['solo'] or s['lock_left_off']:
+        why = 'lfg is on right now' if s['kind'] == 'on' or s['admin'] or s['awake'] or s['solo'] else \
             'Lid sleep is still off' if s['kind'] == 'stuck' else 'The screen lock is still off from a run'
         say('!', why, 'lfg off puts it right · then lfg uninstall', style=colour(AMBER))
         return 1
+    if s['free']:  # the no-password rule goes first: if it can't go, nothing is removed
+        def ask_and_drop():
+            pw = password('Remove lfg · type your Mac password to take out its no-password rule')
+            if pw is None:
+                return 1
+            with Busy():
+                gone = drop_rule(pw)
+            del pw
+            if not gone:
+                say('!', 'lfg is still installed', 'the rule is still there · nothing removed', style=colour(AMBER))
+                return 1
+            return 0
+        try:
+            code = locked(ask_and_drop)  # not while another lfg is starting a run
+        except NoTerminal:
+            say('!', 'Removing lfg needs your Mac password', 'run lfg uninstall in Terminal', style=colour(AMBER))
+            aside('It takes out the no-password rule first.')
+            return 1
+        except KeyboardInterrupt:
+            print()
+            say('·', 'Stopped', 'nothing removed', style='2')
+            return 130
+        if code:
+            return code
     me = os.path.realpath(os.path.join(SHARE, 'lfg'))
     places = [os.path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', os.path.join(HOME, 'bin')]
     for d in os.environ.get('PATH', '').split(':') + places:  # the installer's choices, wherever this runs from
@@ -822,8 +1174,25 @@ def uninstall(args):
     return 0
 
 
+def off_free(s):
+    """`lfg off` in no-password mode: no password, and the screen lock is not touched."""
+    if s['kind'] == 'off':
+        describe(s)
+        return 0
+    with Busy():
+        new = turn_off_free()
+    if not new['sleep_off']:
+        say('✓', 'lfg is off · the Mac can sleep again')
+        return 0
+    say('!', 'Turned off, but lid sleep is still off', "the rule didn't work", style=colour(AMBER))
+    aside('lfg setup --undo takes the rule out and turns lid sleep back on.')
+    return 1
+
+
 def act(what, hours, s):
     running = s['kind'] == 'on'
+    if what == 'off' and s['free']:
+        return off_free(s)
     if what == 'off':
         if s['kind'] == 'off' and not s['lock_left_off']:
             describe(s)
@@ -867,6 +1236,13 @@ def act(what, hours, s):
         return grow(end)
 
     hours = hours or DEFAULT_HOURS
+    way = 'free' if s['free'] else first_run(s)  # first_run: the one-time question, only in a terminal
+    if way == 'stop':
+        return 1
+    if way == 'free':
+        with Busy():
+            new = start_free(int(time.time() + hours * 3600))
+        return report(new, 'On', 'Could not start lfg')
     end = int(s['now'] + hours * 3600)
     pw = password('lfg · keep the Mac awake with the lid shut until %s (%s)' % (clock(end, s['now']),
                                                                               hours_words(hours)),
@@ -887,6 +1263,10 @@ def grow(end):
     s = status()
     if s['kind'] == 'on' and s['until'] - time.time() > 5:
         return extend(end)
+    if s['free']:  # ending this very moment, or already ended: start again, still with no password
+        with Busy():
+            new = start_free(end)
+        return report(new, 'Extended', 'Could not extend')
     # Ending this very moment, or already ended: starting again needs the password.
     why = 'It was just ending, so this needs your password.' if s['kind'] == 'on' else \
         'It ended while you were choosing, so this starts it again.'

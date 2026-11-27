@@ -5,7 +5,7 @@
 # What it does: puts lfg on this Mac (the program goes in ~/.local/share/lfg, the command in a folder already on
 # your PATH). lfg keeps the Mac awake with the lid shut for a few hours, then puts sleep and the screen lock back.
 # Nothing is downloaded: the program is inside this file. Installing changes no Mac settings; lfg itself does,
-# only when you run it and type your password.
+# only when you run it and type your password (or, after you say yes to `lfg setup`, with no password).
 # Remove it all again with:   lfg uninstall
 set -euo pipefail
 
