@@ -832,13 +832,16 @@ def setup_question():
 
 
 def rule_lines():
-    """The rule's two lines: what it is, and the rule. The account by name when sudo reads names like it
-    plainly, else by user id (#501), which needs no escaping."""
+    """The rule's two lines: what it is, and the rule. The account by name when it is a plain lowercase name,
+    else by user id (#501), which needs no escaping (an all-capitals name would read to sudo as an alias)."""
     name = pwd.getpwuid(os.getuid()).pw_name
-    who = name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name) else '#%d' % os.getuid()
+    who = name if re.fullmatch(r'[a-z_][a-z0-9_.-]{0,63}', name) else '#%d' % os.getuid()
     return ('# lfg (github.com/%s) lets %s turn lid sleep off and on with no password. '
             'Nothing else. Take it out with: lfg setup --undo' % (REPO, who),
             '%s ALL = (root) NOPASSWD: %s -a disablesleep 1, %s -a disablesleep 0' % (who, PMSET, PMSET))
+
+
+STILL_IN = "It's in, but doesn't work, and couldn't be taken out: lfg setup --undo"
 
 
 def add_rule(pw):
@@ -852,18 +855,20 @@ def add_rule(pw):
         return "visudo didn't accept it."
     if r.returncode == 4:
         return "With it in, this Mac's sudo settings didn't pass visudo's check."
-    if r.returncode or not os.path.exists(path):
+    if r.returncode:
         return "It couldn't be written."
-    run([SUDO, '-k'], stdin=subprocess.DEVNULL)  # forget the password sudo just took, so the try below can only pass through the rule
-    t = no_password('-a', 'disablesleep', '0')  # lfg's own command; lid sleep is already on, so it changes nothing
-    log('setup: the rule, tried with no password: exit %d' % t.returncode)
-    if t.returncode == 0:
-        return ''
-    r = run([SUDO, '-S', '-p', '', SH, '-c', DEL_RULE, 'lfg-unsetup', path], pw)
-    log('setup: it did not work, taken out: exit %d' % r.returncode)
-    if os.path.exists(path):
-        return "This Mac's sudo doesn't read it. Take it out with lfg setup --undo."
-    return "This Mac's sudo doesn't read it, so it was taken out again."
+    if not os.path.exists(path):  # written, but this account can't see that folder: lfg would never know it's there
+        why = "lfg can't see into %s, so it was taken out again." % SUDOERS_D
+    else:
+        run([SUDO, '-k'], stdin=subprocess.DEVNULL)  # forget the password sudo just took: the try is the rule alone
+        t = no_password('-a', 'disablesleep', '0')  # lfg's own command; lid sleep is already on, so it changes nothing
+        log('setup: the rule, tried with no password: exit %d' % t.returncode)
+        if t.returncode == 0:
+            return ''
+        why = "This Mac's sudo doesn't use it, so it was taken out again."  # not read, or a later rule wins
+    if not drop_rule(pw):
+        return STILL_IN
+    return why
 
 
 def make_free():
@@ -875,7 +880,7 @@ def make_free():
         why = add_rule(pw)
     del pw
     if why:
-        say('!', "Couldn't add the rule", 'it is still there' if os.path.exists(rule_path()) else 'nothing changed',
+        say('!', "Couldn't add the rule", 'it is still there' if why == STILL_IN else 'nothing changed',
             style=colour(AMBER))
         aside(why)
         return False
@@ -942,10 +947,10 @@ def setup(args):
 
 
 def drop_rule(pw):
-    """Take the rule out. -> True if it is gone."""
+    """Take the rule out. -> True if it is gone (by root's own look, as well as ours)."""
     r = run([SUDO, '-S', '-p', '', SH, '-c', DEL_RULE, 'lfg-unsetup', rule_path()], pw)
     log('rule taken out: exit %d' % r.returncode)
-    return not os.path.exists(rule_path())
+    return r.returncode == 0 and not os.path.exists(rule_path())
 
 
 def unsetup():
