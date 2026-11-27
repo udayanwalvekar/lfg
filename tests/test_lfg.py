@@ -108,15 +108,19 @@ cat "$LFG_TEST_DIR/groups" 2>/dev/null || echo "staff everyone admin"
     'visudo': r'''#!/bin/bash
 D="$LFG_TEST_DIR"
 echo "visudo $*" >> "$D/calls.log"
-[ -f "$D/visudo_fail" ] && exit 1
 if [ "$1 $2 $3" = "-c -q -f" ]; then
+  [ -f "$D/visudo_fail" ] && exit 1  # refuses lfg's file
   [ "$(stat -f %Lp "$4")" = 440 ] || exit 1
   [ "$(grep -c . "$4")" = 2 ] || exit 1
   head -n 1 "$4" | grep -q '^# ' || exit 1
   tail -n 1 "$4" | grep -Eqx '(#[0-9]+|[A-Za-z_][A-Za-z0-9_.-]*) ALL = \(root\) NOPASSWD: (/[^ ,]+) -a disablesleep 1, \2 -a disablesleep 0' || exit 1
   exit 0
 fi
-if [ "$1 $2" = "-c -q" ] && [ $# -eq 2 ]; then [ -f "$D/visudo_full_fail" ] && exit 1; exit 0; fi
+if [ "$1 $2" = "-c -q" ] && [ $# -eq 2 ]; then
+  [ -f "$D/visudo_broken" ] && exit 1  # broken before lfg came
+  [ -f "$D/visudo_full_fail" ] && ls "$D/sudoers.d" | grep -qv '[.]' && exit 1  # broken with lfg's rule in
+  exit 0
+fi
 exit 2
 ''',
     # chown 0:0 FILE: can't really hand a file to root here; it only says so.
@@ -695,9 +699,10 @@ class NoPassword(Sandbox):
         self.assertEqual(os.listdir(self.d + '/sudoers.d'), [os.path.basename(self.rule())])  # no .new left
         calls = self.calls()
         new = self.rule() + '.new'
-        # The order that keeps a broken rule out: written as .new, made root's, checked, moved in, all checked,
-        # then tried for real with no password (after sudo forgets the password it just took).
-        order = ['chown 0:0 ' + new, 'visudo -c -q -f ' + new, 'visudo -c -q', 'sudo -k',
+        # The order that keeps a broken rule out: the sudo setup checked as it is, the rule written as .new, made
+        # root's, checked, moved in, all checked again, then tried for real with no password (after sudo forgets
+        # the password it just took).
+        order = ['visudo -c -q', 'chown 0:0 ' + new, 'visudo -c -q -f ' + new, 'visudo -c -q', 'sudo -k',
                  'sudo-n %s -a disablesleep 0' % pmset]
         self.assertEqual([c for c in calls if c.startswith(('chown', 'visudo', 'sudo-n')) or c == 'sudo -k'], order)
         self.assertFalse([c for c in calls if c.startswith('pmset disablesleep 1')])  # nothing kept awake yet
@@ -892,7 +897,8 @@ class NoPassword(Sandbox):
         self.assertEqual(self.lfg('setup'), 1)
         self.assertIn("visudo didn't accept it", self.out)
         self.no_rule_left()
-        self.assertFalse([c for c in self.calls() if c.startswith(('visudo -c -q', 'sudo-n')) and '-f' not in c])
+        self.assertEqual([c for c in self.calls() if c.startswith(('visudo', 'sudo-n'))],
+                         ['visudo -c -q', 'visudo -c -q -f %s.new' % self.rule()])  # never moved in, never tried
 
     def test_visudo_refusing_the_whole_setup_takes_the_rule_out(self):
         self.write('visudo_full_fail', '1')
@@ -901,6 +907,15 @@ class NoPassword(Sandbox):
         self.assertIn("didn't pass visudo's check", self.out)
         self.assertIn('nothing changed', self.out)
         self.no_rule_left()
+
+    def test_a_sudo_setup_already_broken_is_left_alone(self):
+        self.write('visudo_broken', '1')
+        self.at_terminal([0])
+        self.assertEqual(self.lfg('setup'), 1)
+        self.assertIn('already fail', self.out)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+        self.assertEqual([c for c in self.calls() if c.startswith(('visudo', 'chown'))], ['visudo -c -q'])
 
     def test_a_rule_sudo_ignores_is_taken_out_again(self):
         self.write('no_includedir', '1')
@@ -935,7 +950,7 @@ class NoPassword(Sandbox):
         self.assertIn('lfg setup --undo', self.out)
         self.assertNotIn('nothing changed', self.out)
 
-    def test_yes_at_the_first_start_that_fails_starts_nothing(self):
+    def test_yes_at_the_first_start_that_fails_starts_nothing_and_says_so(self):
         self.write('visudo_fail', '1')
         self.at_terminal([0])
         self.assertEqual(self.lfg('2'), 1)
@@ -944,6 +959,46 @@ class NoPassword(Sandbox):
         self.assertEqual(self.read('lock').strip(), 'immediate')
         self.assertEqual(self.loops(), (0, 0))
         self.assertIn('nothing changed', self.out)
+        self.assertIn("lfg isn't on. Type lfg again to start it the usual way.", self.out)
+        os.remove(self.d + '/visudo_fail')
+        self.assertEqual(self.lfg('2'), 0, self.out)  # and the next lfg is the usual run, no question
+        self.assertEqual(len(self.fake.shown), 1)
+        self.assertEqual(self.read('lock').strip(), 'off')
+
+    def test_yes_then_no_password_asks_again_next_time(self):
+        self.at_terminal([0, 1])
+        self.answers = ['nope', 'nope', 'nope']
+        self.assertEqual(self.lfg('2'), 1)
+        self.assertFalse(os.path.exists(self.d + '/state/setup-asked'))
+        self.assertEqual(self.lfg('2'), 0, self.out)  # asked again; No this time, then the usual run
+        self.assertEqual(len(self.fake.shown), 2)
+        self.assertEqual(self.read('state/setup-asked').split()[0], 'no')
+
+    def test_ctrl_c_at_the_password_after_yes_changes_nothing_and_asks_again(self):
+        self.at_terminal([0])
+        self.answers = [KeyboardInterrupt]
+        self.assertEqual(self.lfg('2'), 130)
+        self.assertIn('nothing changed', self.out)
+        self.no_rule_left()
+        self.assertFalse(os.path.exists(self.d + '/state/setup-asked'))
+
+    def test_esc_is_no_and_the_screen_says_so(self):
+        self.at_terminal([None])
+        self.assertEqual(self.lfg('2'), 0, self.out)
+        self.assertEqual(self.read('state/setup-asked').split()[0], 'no')
+        self.assertIn('Esc is No', self.fake.shown[0][3])
+        self.assertEqual(self.read('lock').strip(), 'off')  # the usual run
+
+    def test_uninstall_waits_for_another_window(self):
+        """Another window has the setup question open: uninstall must not pull lfg out from under it."""
+        import fcntl
+        Shared.make_install(self)
+        with open(os.path.join(lfg.STATE, 'lock'), 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            self.assertEqual(self.lfg('uninstall'), 1)
+        self.assertIn('busy in another window', self.out)
+        self.assertTrue(os.path.exists(lfg.SHARE + '/lfg'))
+        self.assertTrue(os.path.islink(self.d + '/onpath/lfg'))
 
     def test_three_wrong_passwords_at_setup_change_nothing(self):
         self.at_terminal([0])
@@ -1062,6 +1117,7 @@ class NoPassword(Sandbox):
         self.write('no_includedir', '1')
         self.assertEqual(self.lfg('2'), 1)
         self.assertIn("no-password rule didn't work", self.out)
+        self.assertNotIn('No password needed', self.out)
         self.assertIn('lfg is off', self.out)
         self.assertEqual(self.read('sleepdisabled').strip(), '0')
         self.assertTrue(self.wait(lambda: self.solo() == 0, 5))

@@ -126,8 +126,10 @@ SOLO_LOOP = ('f=$1; tick=$2; good=$3; caff=$4; cap=$5; sudo=$6; pmset=$7; log=$8
 # it root's and read-only, have visudo check it, and only then move it into place; then visudo checks the whole
 # sudo setup with it, and takes it out again if that fails. Nothing reads stdin (the password is in it).
 # Args: $1 the rule's path, $2 $3 its two lines, $4 visudo, $5 chown. Exit 3 = visudo refused the rule,
-# 4 = visudo refused the whole setup with it in (taken out again), 5 = it could not be written.
-ADD_RULE = ('exec </dev/null; umask 077; r=$1; t="$1.new"; /bin/rm -f "$t" || exit 5; '
+# 4 = visudo refused the whole setup with it in (taken out again), 5 = it could not be written, 6 = the sudo
+# setup already failed visudo's check before lfg touched anything (left alone).
+ADD_RULE = ('exec </dev/null; "$4" -c -q >/dev/null 2>&1 || exit 6; umask 077; r=$1; t="$1.new"; '
+            '/bin/rm -f "$t" || exit 5; '
             '/usr/bin/printf "%s\\n%s\\n" "$2" "$3" > "$t" || { /bin/rm -f "$t"; exit 5; }; '
             '{ "$5" 0:0 "$t" && /bin/chmod 0440 "$t"; } || { /bin/rm -f "$t"; exit 5; }; '
             '"$4" -c -q -f "$t" >/dev/null 2>&1 || { /bin/rm -f "$t"; exit 3; }; '
@@ -398,7 +400,7 @@ def describe(s, out=None):
         say('·', 'lfg is off', 'lfg = 3 hours, lfg 6 = 6 hours', style='2', out=out)
     if s['kind'] in ('off', 'stuck') and s['lock_left_off']:
         say('!', 'The screen lock is still off', 'lfg off turns it back on', style=colour(AMBER), out=out)
-    if s['free']:
+    if s['free'] and s['kind'] != 'stuck' and not s.get('refused'):
         aside('No password needed to start, stop or extend it.', out)
 
 
@@ -803,7 +805,7 @@ SETUP_NOTES = ['Type it one last time and lfg adds one rule to this Mac.',
                'the lid shut, and locks like it normally does.']
 SETUP_ROWS = [('Yes, never ask again', 'asks your password one last time'),
               ('No, keep asking', 'lfg works like it does now')]
-SETUP_HINT = '  ↑ ↓ move  ·  Enter choose  ·  or press its number  ·  Esc not now'
+SETUP_HINT = '  ↑ ↓ move  ·  Enter choose  ·  or press its number  ·  Esc is No'
 
 
 def can_ask():
@@ -818,7 +820,8 @@ def can_ask():
 
 
 def setup_question():
-    """The one question, on its own screen. -> True (yes), False (no or Esc). Raises NoTerminal."""
+    """The one question, on its own screen. -> True (yes), False (no or Esc). Raises NoTerminal. A No is saved
+    here; a Yes only once the password was given (see answered), so a Yes that never got that far asks again."""
     try:
         menu = Menu()
     except (OSError, termios.error):
@@ -827,8 +830,14 @@ def setup_question():
         at = menu.question(SETUP_TITLE, SETUP_NOTES, SETUP_ROWS, SETUP_HINT)
     finally:
         menu.close()
-    write_text(ASKED, '%s %s' % ('yes' if at == 0 else 'no', time.strftime('%Y-%m-%d')))
+    if at != 0:
+        answered('no')
     return at == 0
+
+
+def answered(word):
+    """The first-start question is never shown again."""
+    write_text(ASKED, '%s %s' % (word, time.strftime('%Y-%m-%d')))
 
 
 def rule_lines():
@@ -849,8 +858,11 @@ def add_rule(pw):
     if visudo passes it, and stays only if sudo then really runs lfg's command without a password."""
     path = rule_path()
     first, second = rule_lines()
-    r = run([SUDO, '-S', '-p', '', SH, '-c', ADD_RULE, 'lfg-setup', path, first, second, VISUDO, CHOWN], pw)
+    r = run([SUDO, '-S', '-p', '', SH, '-c', ADD_RULE, 'lfg-setup', path, first, second, VISUDO, CHOWN], pw,
+            timeout=120)
     log('setup: add the rule: exit %d' % r.returncode)
+    if r.returncode == 6:
+        return "This Mac's sudo settings already fail visudo's check. Left alone."
     if r.returncode == 3:
         return "visudo didn't accept it."
     if r.returncode == 4:
@@ -872,18 +884,20 @@ def add_rule(pw):
 
 
 def make_free():
-    """Yes to the question: the password one last time, the rule in, tried. -> True if it is on."""
+    """Yes to the question: the password one last time, the rule in, tried. -> 'on' (it is in and works),
+    'failed' (the password was right, the rule didn't go in), None (no password given)."""
     pw = password('Type your Mac password one last time', 'lfg adds the rule with it. The password is not kept.')
     if pw is None:
-        return False
+        return None
     with Busy():
         why = add_rule(pw)
     del pw
+    answered('yes')
     if why:
         say('!', "Couldn't add the rule", 'it is still there' if why == STILL_IN else 'nothing changed',
             style=colour(AMBER))
         aside(why)
-        return False
+        return 'failed'
     try:
         os.remove(LOCK_BEFORE)  # the screen lock is no longer lfg's business
     except OSError:
@@ -891,7 +905,7 @@ def make_free():
     say('✓', "Done · lfg won't ask for your password again")
     aside('The rule allows only pmset -a disablesleep 1 and 0, as admin.')
     aside("It's in %s. lfg setup --undo takes it out." % rule_path())
-    return True
+    return 'on'
 
 
 def busy_now(s):
@@ -913,10 +927,17 @@ def first_run(s):
     password), 'stop' (yes, but it didn't work: say so and stop) or 'usual' (no, or not asked)."""
     if s['free'] or os.path.lexists(ASKED) or not os.path.isdir(SUDOERS_D) or not can_ask() or busy_now(s):
         return 'usual'
-    if not setup_question():
+    yes = setup_question()
+    s['now'] = time.time()  # the question may have been open a while: the run's hours count from now
+    if not yes:
         say('·', 'lfg will keep asking for your password', 'lfg setup changes that', style='2')
         return 'usual'
-    return 'free' if make_free() else 'stop'
+    done = make_free()
+    if done == 'on':
+        return 'free'
+    if done == 'failed':  # not the usual run instead: he had just read that the screen lock would stay on
+        aside("lfg isn't on. Type lfg again to start it the usual way.")
+    return 'stop'
 
 
 def setup(args):
@@ -935,7 +956,7 @@ def setup(args):
         say('!', problem, 'lfg off, then lfg setup', style=colour(AMBER))
         return 1
     if not os.path.isdir(SUDOERS_D):
-        say('!', "This Mac can't take the rule", 'it has no %s · nothing changed' % SUDOERS_D, style=colour(AMBER))
+        say('!', "This Mac can't take the rule", 'no %s · nothing changed' % SUDOERS_D, style=colour(AMBER))
         return 1
     if not can_ask():
         say('!', 'lfg setup needs you at the Mac', 'run it in Terminal', style=colour(AMBER))
@@ -943,7 +964,7 @@ def setup(args):
     if not setup_question():
         say('·', 'Nothing changed', 'lfg keeps asking for your password', style='2')
         return 0
-    return 0 if make_free() else 1
+    return 0 if make_free() == 'on' else 1
 
 
 def drop_rule(pw):
@@ -1135,8 +1156,22 @@ def update(args):
 
 
 def uninstall(args):
-    """`lfg uninstall`: remove the program, its command and ~/.lfg. Refused while a run is on, so nothing is
-    left with lid sleep off and no one to turn it back on."""
+    """`lfg uninstall`: remove the program, its command and ~/.lfg (and the no-password rule first, if it is in).
+    One lfg at a time: never while another window is starting a run or adding the rule."""
+    try:
+        return locked(remove)
+    except NoTerminal:
+        say('!', 'Removing lfg needs your Mac password', 'run lfg uninstall in Terminal', style=colour(AMBER))
+        aside('It takes out the no-password rule first.')
+        return 1
+    except KeyboardInterrupt:  # only possible at the password: the rest runs with Ctrl-C held
+        print()
+        say('·', 'Stopped', 'nothing removed', style='2')
+        return 130
+
+
+def remove():
+    """Refused while a run is on, so nothing is left with lid sleep off and no one to turn it back on."""
     s = status()
     if s['kind'] in ('on', 'stuck') or s['admin'] or s['awake'] or s['solo'] or s['lock_left_off']:
         why = 'lfg is on right now' if s['kind'] == 'on' or s['admin'] or s['awake'] or s['solo'] else \
@@ -1144,37 +1179,24 @@ def uninstall(args):
         say('!', why, 'lfg off puts it right · then lfg uninstall', style=colour(AMBER))
         return 1
     if s['free']:  # the no-password rule goes first: if it can't go, nothing is removed
-        def ask_and_drop():
-            pw = password('Remove lfg · type your Mac password to take out its no-password rule')
-            if pw is None:
-                return 1
-            with Busy():
-                gone = drop_rule(pw)
-            del pw
-            if not gone:
-                say('!', 'lfg is still installed', 'the rule is still there · nothing removed', style=colour(AMBER))
-                return 1
-            return 0
-        try:
-            code = locked(ask_and_drop)  # not while another lfg is starting a run
-        except NoTerminal:
-            say('!', 'Removing lfg needs your Mac password', 'run lfg uninstall in Terminal', style=colour(AMBER))
-            aside('It takes out the no-password rule first.')
+        pw = password('Remove lfg · type your Mac password to take out its no-password rule')
+        if pw is None:
             return 1
-        except KeyboardInterrupt:
-            print()
-            say('·', 'Stopped', 'nothing removed', style='2')
-            return 130
-        if code:
-            return code
-    me = os.path.realpath(os.path.join(SHARE, 'lfg'))
-    places = [os.path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', os.path.join(HOME, 'bin')]
-    for d in os.environ.get('PATH', '').split(':') + places:  # the installer's choices, wherever this runs from
-        p = os.path.join(d, 'lfg')
-        if d and os.path.islink(p) and os.path.realpath(p) == me:
-            os.unlink(p)
-    shutil.rmtree(SHARE, ignore_errors=True)
-    shutil.rmtree(STATE, ignore_errors=True)
+        with Busy():
+            gone = drop_rule(pw)
+        del pw
+        if not gone:
+            say('!', 'lfg is still installed', 'the rule is still there · nothing removed', style=colour(AMBER))
+            return 1
+    with Busy():
+        me = os.path.realpath(os.path.join(SHARE, 'lfg'))
+        places = [os.path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', os.path.join(HOME, 'bin')]
+        for d in os.environ.get('PATH', '').split(':') + places:  # the installer's choices, wherever this runs from
+            p = os.path.join(d, 'lfg')
+            if d and os.path.islink(p) and os.path.realpath(p) == me:
+                os.unlink(p)
+        shutil.rmtree(SHARE, ignore_errors=True)
+        shutil.rmtree(STATE, ignore_errors=True)
     say('✓', 'lfg is removed')
     return 0
 

@@ -16,7 +16,7 @@ The installer puts the program in `~/.local/share/lfg` and the `lfg` command in 
 
 ## How to use it
 
-**Just type `lfg` and press Enter.** Type your Mac password once and it's on for 3 hours.
+**Just type `lfg` and press Enter.** Type your Mac password once and it's on for 3 hours. (The very first time, it asks first if you'd rather never type it again. More below.)
 
 <img src="docs/start.png" alt="Typing lfg: it asks for the Mac password once, then says it is on until 22:17 with 3 hours left" width="700">
 
@@ -34,7 +34,7 @@ Pick Custom and type the hours: the new end time shows as you type.
 
 **While it's on, your screen lock is off: anyone who opens the lid gets in without a password.** Keep the laptop with you. (Not if you say yes to `lfg setup`, below.)
 
-**Don't want to type your password every time?** Type `lfg setup` and say yes. You type your password one last time, and that's it: starting, stopping and adding time never ask again. The first time you type `lfg` in Terminal, it asks you this once.
+**Don't want to type your password every time?** Type `lfg setup` and say yes. You type your password one last time, and that's it: lfg never asks again, not to start and not to stop. The first time you type `lfg` in Terminal, it asks you this once.
 
 <img src="docs/setup.png" alt="lfg setup: Never ask for your password again? It explains the rule it adds, then Yes, never ask again or No, keep asking" width="700">
 
@@ -65,11 +65,11 @@ Say no, and lfg works exactly like it always has.
 
 | Type | What happens |
 |---|---|
-| `lfg` | On for 3 hours. Asks your Mac password once. |
+| `lfg` | On for 3 hours. Asks your Mac password once (never, after `lfg setup`). |
 | `lfg 6` | On for 6 hours from now. Never cuts a longer run short. |
 | `lfg` (while on) | Shows when it started, when it ends and how long is left, then lets you add 3 hours, 6 hours or any number you type, turn it off, or leave it. |
 | `lfg +2` | Adds 2 hours to the current end. No password while it's on. |
-| `lfg off` | Off now: sleep and your screen lock come back. Asks your password. |
+| `lfg off` | Off now: sleep and your screen lock come back. Asks your password. After `lfg setup`: no password, and the screen lock was never touched. |
 | `lfg status` | Says whether it is on and until when. Changes nothing. |
 | `lfg setup` | Never asks for your password again. Asks it one last time to add the rule. |
 | `lfg setup --undo` | Takes the rule out. lfg asks for your password again. |
@@ -78,13 +78,13 @@ Say no, and lfg works exactly like it always has.
 
 ## What it does
 
-While it's on, the Mac doesn't sleep when you close the lid, stays on Wi-Fi, and doesn't lock its screen. When the time is up, lid sleep comes back by itself and a Terminal window asks for your password to put the screen lock back the way you had it (if you keep it off, there's no window and it stays off). If that window doesn't show up, run `lfg off`.
+While it's on, the Mac doesn't sleep when you close the lid, stays on Wi-Fi, and doesn't lock its screen. When the time is up, lid sleep comes back by itself and a Terminal window asks for your password to put the screen lock back the way you had it (if you keep it off, there's no window and it stays off). If that window doesn't show up, run `lfg off`. After `lfg setup`, the screen lock is left alone and no window opens.
 
 - **Anyone who opens the lid gets in without a password while it's on.** Keep the laptop with you, or turn lfg off before you leave it somewhere.
 - Don't put the Mac in a bag while it's on: a closed laptop that stays awake gets hot.
 - Adding time needs no password, so an agent can run `lfg +3` while you're away. That also means any program on your Mac can push the end time out, up to 72 hours ahead.
 - After `lfg setup`, an agent can also start it (`lfg 6`) and stop it (`lfg off`), with no password and no Terminal. The rule is the file `/etc/sudoers.d/lfg-` plus your user id. It allows exactly `pmset -a disablesleep 1` and `pmset -a disablesleep 0`, and lfg checks it with `visudo` before putting it in place.
-- If the Mac restarts during a run, lid sleep stays off until you run `lfg off`. `lfg status` tells you when that's the case.
+- If the Mac restarts during a run, lid sleep stays off until you run `lfg off`. After `lfg setup`, logging out during a run does the same. `lfg status` tells you when that's the case.
 - Every step is written to `~/.lfg/log`. Your password never is.
 
 ## Remove it
